@@ -1,0 +1,6 @@
+telethon>=1.40,<2
+python-dotenv>=1.0,<2
+streamlit>=1.45,<2
+requests>=2.32,<3
+numpy>=2.0,<3
+pillow>=10,<12

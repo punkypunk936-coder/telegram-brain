@@ -1,0 +1,11 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+data/*
+!data/.gitkeep
+.DS_Store
+*.bak
+app_backup.py
