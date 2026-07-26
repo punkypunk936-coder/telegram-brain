@@ -592,8 +592,11 @@ def pending_count(connection) -> int:
             """
             SELECT COUNT(*)
             FROM messages
-            WHERE enrichment_version < ?
-               OR content_status IN ('pending', 'processing')
+            WHERE duplicate_of_id IS NULL
+              AND (
+                  enrichment_version < ?
+                  OR content_status IN ('pending', 'processing')
+              )
             """,
             (ENRICHMENT_VERSION,),
         ).fetchone()[0]
@@ -605,8 +608,11 @@ def next_pending(connection, limit: int = 12) -> list[dict]:
         """
         SELECT *
         FROM messages
-        WHERE enrichment_version < ?
-           OR content_status IN ('pending', 'processing')
+        WHERE duplicate_of_id IS NULL
+          AND (
+              enrichment_version < ?
+              OR content_status IN ('pending', 'processing')
+          )
         ORDER BY
             CASE
                 WHEN media_type IN ('pdf', 'document', 'audio') THEN 0

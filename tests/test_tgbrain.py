@@ -3,6 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image, ImageDraw
+
+from media_dedupe import (
+    backfill_media_duplicates,
+    find_duplicate,
+    fingerprint_media,
+)
 from tgbrain import (
     Settings,
     build_indexed_text,
@@ -45,6 +52,7 @@ class TelegramBrainTests(unittest.TestCase):
         message_id,
         text,
         media_type=None,
+        media_path=None,
         file_name=None,
         date_utc=None,
     ):
@@ -58,7 +66,7 @@ class TelegramBrainTests(unittest.TestCase):
                 "sender_name": "owner",
                 "text": text,
                 "media_type": media_type,
-                "media_path": None,
+                "media_path": str(media_path) if media_path else None,
                 "file_name": file_name,
                 "mime_type": None,
                 "urls_json": json.dumps([]),
@@ -326,6 +334,151 @@ class TelegramBrainTests(unittest.TestCase):
         )
 
         self.assertEqual([row["message_id"] for row in results], [60])
+
+    def _meme_canvas(self, variant: bool = False) -> Image.Image:
+        image = Image.new("RGB", (720, 480), "#f2f2ed")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 720, 90), fill="#172a3a")
+        draw.rectangle((45, 140, 675, 420), outline="#172a3a", width=8)
+        draw.ellipse((90, 185, 250, 345), fill="#27a69a")
+        draw.rectangle(
+            (330, 190, 620, 250),
+            fill="#d84f3f" if variant else "#172a3a",
+        )
+        draw.rectangle((330, 285, 560, 325), fill="#d8842f")
+        if variant:
+            draw.rectangle((330, 345, 650, 395), fill="#111111")
+        return image
+
+    def test_exact_repeat_keeps_earliest_asset_and_hides_later_copy(self):
+        root = Path(self.temp_dir.name)
+        original = root / "original.png"
+        repeated = root / "repeated.png"
+        self._meme_canvas().save(original)
+        repeated.write_bytes(original.read_bytes())
+        self.insert(
+            71,
+            "Same meme shared again",
+            media_type="image",
+            media_path=repeated,
+            file_name=repeated.name,
+            date_utc="2026-07-02T12:00:00+00:00",
+        )
+        self.insert(
+            70,
+            "The original meme",
+            media_type="image",
+            media_path=original,
+            file_name=original.name,
+            date_utc="2026-07-01T12:00:00+00:00",
+        )
+
+        counts = backfill_media_duplicates(self.connection)
+        rows = self.connection.execute(
+            """
+            SELECT id, message_id, duplicate_of_id, duplicate_reason
+            FROM messages
+            WHERE message_id IN (70, 71)
+            ORDER BY message_id
+            """
+        ).fetchall()
+        visible = search(self.connection, self.config, "", limit=20)
+
+        self.assertEqual(counts["exact"], 1)
+        self.assertIsNone(rows[0]["duplicate_of_id"])
+        self.assertEqual(rows[1]["duplicate_of_id"], rows[0]["id"])
+        self.assertEqual(rows[1]["duplicate_reason"], "exact")
+        original_result = next(
+            row for row in visible if row["message_id"] == 70
+        )
+        self.assertEqual(original_result["_duplicate_count"], 1)
+        self.assertNotIn(71, [row["message_id"] for row in visible])
+
+    def test_reencoded_image_is_detected_but_changed_meme_is_kept(self):
+        root = Path(self.temp_dir.name)
+        original = root / "meme-original.jpg"
+        reencoded = root / "meme-reencoded.jpg"
+        changed = root / "meme-changed.jpg"
+        self._meme_canvas().save(original, quality=96)
+        self._meme_canvas().save(reencoded, quality=76)
+        self._meme_canvas(variant=True).save(changed, quality=88)
+        self.insert(
+            80,
+            "Original visual",
+            media_type="image",
+            media_path=original,
+            file_name=original.name,
+            date_utc="2026-07-03T12:00:00+00:00",
+        )
+        self.insert(
+            81,
+            "Telegram re-encoded visual",
+            media_type="image",
+            media_path=reencoded,
+            file_name=reencoded.name,
+            date_utc="2026-07-04T12:00:00+00:00",
+        )
+        self.insert(
+            82,
+            "A genuinely changed meme",
+            media_type="image",
+            media_path=changed,
+            file_name=changed.name,
+            date_utc="2026-07-05T12:00:00+00:00",
+        )
+
+        counts = backfill_media_duplicates(self.connection)
+        rows = {
+            row["message_id"]: row
+            for row in self.connection.execute(
+                """
+                SELECT message_id, duplicate_of_id, duplicate_reason
+                FROM messages
+                WHERE message_id IN (80, 81, 82)
+                """
+            ).fetchall()
+        }
+
+        self.assertEqual(counts["visual"], 1)
+        self.assertEqual(rows[81]["duplicate_reason"], "visual")
+        self.assertIsNotNone(rows[81]["duplicate_of_id"])
+        self.assertIsNone(rows[82]["duplicate_of_id"])
+
+    def test_new_exact_repeat_is_recognised_before_archive_backfill(self):
+        root = Path(self.temp_dir.name)
+        original = root / "instant-original.png"
+        repeated = root / "instant-repeat.png"
+        self._meme_canvas().save(original)
+        repeated.write_bytes(original.read_bytes())
+        fingerprint = fingerprint_media(original, "image")
+        upsert(
+            self.connection,
+            {
+                "chat_id": 777000,
+                "message_id": 90,
+                "date_utc": "2026-07-06T12:00:00+00:00",
+                "sender_name": "owner",
+                "text": "Canonical meme",
+                "media_type": "image",
+                "media_path": str(original),
+                "file_name": original.name,
+                "mime_type": "image/png",
+                "urls_json": "[]",
+                **fingerprint,
+            },
+        )
+
+        duplicate = find_duplicate(
+            self.connection,
+            fingerprint_media(repeated, "image"),
+            repeated,
+            "image",
+            chat_id=777000,
+            message_id=91,
+        )
+
+        self.assertIsNotNone(duplicate)
+        self.assertEqual(duplicate["reason"], "exact")
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ def update_counts(connection) -> None:
             """
             SELECT content_status, COUNT(*) AS n
             FROM messages
+            WHERE duplicate_of_id IS NULL
             GROUP BY content_status
             """
         ).fetchall()

@@ -397,20 +397,40 @@ if "service_bootstrapped" not in st.session_state:
 stats = connection.execute(
     """
     SELECT
-        COUNT(DISTINCT COALESCE(capture_id, chat_id || ':' || message_id))
+        COUNT(DISTINCT CASE
+            WHEN duplicate_of_id IS NULL
+            THEN COALESCE(capture_id, chat_id || ':' || message_id)
+        END)
             AS total,
-        COUNT(*) AS messages,
+        SUM(CASE WHEN duplicate_of_id IS NULL THEN 1 ELSE 0 END)
+            AS messages,
         SUM(CASE WHEN is_sensitive = 1 THEN 1 ELSE 0 END) AS sensitive,
-        SUM(CASE WHEN media_path IS NOT NULL THEN 1 ELSE 0 END) AS media,
-        SUM(CASE WHEN urls_json != '[]' THEN 1 ELSE 0 END) AS links,
-        SUM(CASE WHEN content_status = 'ready' THEN 1 ELSE 0 END)
+        SUM(CASE
+            WHEN media_path IS NOT NULL AND duplicate_of_id IS NULL
+            THEN 1 ELSE 0
+        END) AS media,
+        SUM(CASE
+            WHEN urls_json != '[]' AND duplicate_of_id IS NULL
+            THEN 1 ELSE 0
+        END) AS links,
+        SUM(CASE
+            WHEN content_status = 'ready' AND duplicate_of_id IS NULL
+            THEN 1 ELSE 0
+        END)
             AS indexed,
+        SUM(CASE WHEN duplicate_of_id IS NOT NULL THEN 1 ELSE 0 END)
+            AS duplicates,
         MAX(date_utc) AS latest
     FROM messages
     """
 ).fetchone()
 starred_count = connection.execute(
-    "SELECT COUNT(*) AS n FROM item_state WHERE starred = 1"
+    """
+    SELECT COUNT(*) AS n
+    FROM item_state s
+    JOIN messages m ON m.id = s.message_row_id
+    WHERE s.starred = 1 AND m.duplicate_of_id IS NULL
+    """
 ).fetchone()["n"]
 
 bucket_rows = [
@@ -463,6 +483,7 @@ bucket_rows = [
             FROM messages m
             LEFT JOIN item_state s ON s.message_row_id = m.id
             WHERE m.is_sensitive = 0
+              AND m.duplicate_of_id IS NULL
         ),
         classified AS (
             SELECT
@@ -661,6 +682,10 @@ with st.sidebar:
     st.divider()
     st.caption(
         f"{stats['sensitive'] or 0} sensitive item(s) protected and hidden."
+    )
+    st.caption(
+        f"{stats['duplicates'] or 0} repeated media item(s) hidden; "
+        "originals retained."
     )
     st.caption(
         "Semantic search "
@@ -1001,6 +1026,11 @@ for row in page_rows:
             st.badge(category, color="gray")
             status_label, status_color = index_label(row)
             st.badge(status_label, color=status_color)
+            if row.get("_duplicate_count"):
+                st.badge(
+                    f"{row['_duplicate_count']} repeats avoided",
+                    color="gray",
+                )
             st.markdown(
                 f'<div class="result-title">{html.escape(title)}</div>',
                 unsafe_allow_html=True,

@@ -17,6 +17,11 @@ import requests
 from dotenv import load_dotenv
 from telethon import TelegramClient
 
+from media_dedupe import (
+    find_duplicate,
+    fingerprint_media,
+)
+
 
 load_dotenv()
 
@@ -394,6 +399,13 @@ CREATE TABLE IF NOT EXISTS messages(
     capture_id TEXT,
     capture_position INTEGER NOT NULL DEFAULT 0,
     capture_version INTEGER NOT NULL DEFAULT 0,
+    media_sha256 TEXT,
+    visual_hash TEXT,
+    media_aspect REAL,
+    duplicate_of_id INTEGER,
+    duplicate_reason TEXT,
+    duplicate_distance REAL,
+    fingerprint_version INTEGER NOT NULL DEFAULT 0,
     category TEXT NOT NULL DEFAULT 'Uncategorised',
     is_sensitive INTEGER NOT NULL DEFAULT 0,
     sensitive_reason TEXT,
@@ -487,6 +499,13 @@ def _migrate(connection: sqlite3.Connection) -> None:
         "capture_id": "TEXT",
         "capture_position": "INTEGER NOT NULL DEFAULT 0",
         "capture_version": "INTEGER NOT NULL DEFAULT 0",
+        "media_sha256": "TEXT",
+        "visual_hash": "TEXT",
+        "media_aspect": "REAL",
+        "duplicate_of_id": "INTEGER",
+        "duplicate_reason": "TEXT",
+        "duplicate_distance": "REAL",
+        "fingerprint_version": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, definition in additions.items():
         if name not in columns:
@@ -505,6 +524,18 @@ def _migrate(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_content_status "
         "ON messages(content_status)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_sha256 "
+        "ON messages(media_sha256)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_visual_hash "
+        "ON messages(visual_hash)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_duplicate_of "
+        "ON messages(duplicate_of_id)"
     )
     connection.commit()
 
@@ -1011,7 +1042,10 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         """
         SELECT media_path, urls_json, vision_text, extracted_text,
                link_metadata_json, content_status, content_error,
-               enrichment_version, enriched_at, embedding_json
+               enrichment_version, enriched_at, embedding_json,
+               media_sha256, visual_hash, media_aspect,
+               duplicate_of_id, duplicate_reason, duplicate_distance,
+               fingerprint_version
         FROM messages
         WHERE chat_id = ? AND message_id = ?
         """,
@@ -1032,6 +1066,13 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
             "enrichment_version",
             "enriched_at",
             "embedding_json",
+            "media_sha256",
+            "visual_hash",
+            "media_aspect",
+            "duplicate_of_id",
+            "duplicate_reason",
+            "duplicate_distance",
+            "fingerprint_version",
         ):
             if enriched.get(field) in {None, "", "[]"}:
                 enriched[field] = existing[field]
@@ -1045,6 +1086,13 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         enriched["enrichment_version"] = 0
         enriched["enriched_at"] = None
         enriched["embedding_json"] = None
+        enriched.setdefault("media_sha256", None)
+        enriched.setdefault("visual_hash", None)
+        enriched.setdefault("media_aspect", None)
+        enriched.setdefault("duplicate_of_id", None)
+        enriched.setdefault("duplicate_reason", None)
+        enriched.setdefault("duplicate_distance", None)
+        enriched.setdefault("fingerprint_version", 0)
 
     enriched.setdefault("vision_text", "")
     enriched.setdefault("extracted_text", "")
@@ -1054,6 +1102,7 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
     enriched.setdefault("enrichment_version", 0)
     enriched.setdefault("capture_position", 0)
     enriched.setdefault("capture_version", 0)
+    enriched.setdefault("fingerprint_version", 0)
     enriched["indexed_text"] = build_indexed_text(enriched)
     enriched.update(message_metadata(enriched))
     inherited = _inherited_category(connection, enriched)
@@ -1083,6 +1132,13 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         "capture_id",
         "capture_position",
         "capture_version",
+        "media_sha256",
+        "visual_hash",
+        "media_aspect",
+        "duplicate_of_id",
+        "duplicate_reason",
+        "duplicate_distance",
+        "fingerprint_version",
         "category",
         "is_sensitive",
         "sensitive_reason",
@@ -1147,11 +1203,13 @@ async def ingest(
     if path and not Path(path).exists():
         path = None
 
+    downloaded_path = None
     if message.media and not path:
         output = config.media_dir / str(config.chat_id)
         output.mkdir(parents=True, exist_ok=True)
         downloaded = await message.download_media(file=str(output))
         path = str(Path(downloaded).resolve()) if downloaded else None
+        downloaded_path = path
 
     file_name = (
         getattr(getattr(message, "file", None), "name", None)
@@ -1166,6 +1224,35 @@ async def ingest(
     text = message.raw_text or ""
     urls = URL_RE.findall(text)
     kind = media_kind(path, mime_type)
+    fingerprint = {
+        "media_sha256": None,
+        "visual_hash": None,
+        "media_aspect": None,
+        "fingerprint_version": 0,
+    }
+    duplicate = None
+    if path and Path(path).exists():
+        try:
+            fingerprint = fingerprint_media(path, kind)
+            duplicate = find_duplicate(
+                connection,
+                fingerprint,
+                path,
+                kind,
+                chat_id=config.chat_id,
+                message_id=message.id,
+            )
+        except OSError:
+            pass
+    if (
+        duplicate
+        and duplicate["reason"] == "exact"
+        and downloaded_path
+        and Path(downloaded_path) != Path(duplicate["media_path"])
+        and Path(duplicate["media_path"]).exists()
+    ):
+        Path(downloaded_path).unlink(missing_ok=True)
+        path = duplicate["media_path"]
 
     upsert(
         connection,
@@ -1183,6 +1270,14 @@ async def ingest(
             "vision_text": "",
             "indexed_text": "",
             "embedding_json": None,
+            **fingerprint,
+            "duplicate_of_id": duplicate["id"] if duplicate else None,
+            "duplicate_reason": (
+                duplicate["reason"] if duplicate else None
+            ),
+            "duplicate_distance": (
+                duplicate["distance"] if duplicate else None
+            ),
             "telegram_group_id": (
                 str(message.grouped_id)
                 if getattr(message, "grouped_id", None)
@@ -1236,7 +1331,7 @@ def _base_filters(
     category: str | None,
     starred_only: bool,
 ) -> tuple[list[str], list]:
-    clauses = []
+    clauses = ["m.duplicate_of_id IS NULL"]
     params: list = []
     if not include_sensitive:
         clauses.append("m.is_sensitive = 0")
@@ -1399,6 +1494,9 @@ def _combine_capture(parts: list[dict], query: str) -> dict:
         or (part.get("urls_json") or "[]") != "[]"
         for part in parts
     )
+    duplicate_count = sum(
+        int(part.get("_duplicate_count") or 0) for part in parts
+    )
     indexed_parts = sum(
         (part.get("content_status") or "") == "ready" for part in parts
     )
@@ -1441,6 +1539,7 @@ def _combine_capture(parts: list[dict], query: str) -> dict:
             "content_error": " · ".join(errors),
             "_expected_parts": expected_parts,
             "_indexed_parts": indexed_parts,
+            "_duplicate_count": duplicate_count,
             "_match_reasons": _match_reasons(parts, query),
             "_keyword_score": max(
                 float(part.get("_keyword_score") or 0) for part in parts
@@ -1491,11 +1590,30 @@ def collapse_captures(
             LEFT JOIN item_state s ON s.message_row_id = m.id
             WHERE m.capture_id IN ({placeholders})
               {sensitivity}
+              AND m.duplicate_of_id IS NULL
             ORDER BY m.capture_id, m.capture_position, m.message_id
             """,
             batch,
         ).fetchall()
         members.extend(dict(row) for row in fetched)
+
+    member_ids = [member["id"] for member in members]
+    duplicate_counts: dict[int, int] = {}
+    for start in range(0, len(member_ids), 400):
+        batch = member_ids[start : start + 400]
+        placeholders = ",".join("?" * len(batch))
+        for row in connection.execute(
+            f"""
+            SELECT duplicate_of_id, COUNT(*) AS n
+            FROM messages
+            WHERE duplicate_of_id IN ({placeholders})
+            GROUP BY duplicate_of_id
+            """,
+            batch,
+        ).fetchall():
+            duplicate_counts[int(row["duplicate_of_id"])] = int(row["n"])
+    for member in members:
+        member["_duplicate_count"] = duplicate_counts.get(member["id"], 0)
 
     grouped: dict[str, list[dict]] = {}
     for member in members:

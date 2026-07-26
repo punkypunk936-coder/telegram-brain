@@ -12,6 +12,8 @@ Telegram's service chat when you use it as a personal inbox.
 - Transcribes voice notes locally with whisper.cpp and fetches public link
   titles and descriptions.
 - Combines adjacent message parts and media albums into one capture.
+- Keeps the earliest media asset and hides exact or safely detected re-encoded
+  repeat shares from the visible library.
 - Shows live-sync health inside the dashboard.
 - Opens on a history-driven bucket homepage with the newest classified capture.
 - Searches original text, OCR, documents, transcripts, link metadata and
@@ -74,6 +76,12 @@ For only the messages added since the previous import:
 
 ```bash
 python sync_history.py
+```
+
+To fingerprint an existing archive and collapse repeat media:
+
+```bash
+python dedupe_media.py
 ```
 
 ### 5. Start the app
