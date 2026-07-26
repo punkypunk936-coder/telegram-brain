@@ -7,9 +7,16 @@ Telegram's service chat when you use it as a personal inbox.
 
 - Imports the selected chat's existing history and media.
 - Catches up quietly and watches for new or edited messages.
+- Reads images with local macOS OCR and extracts text from PDFs, Office files
+  and common text formats.
+- Transcribes voice notes locally with whisper.cpp and fetches public link
+  titles and descriptions.
+- Combines adjacent message parts and media albums into one capture.
 - Shows live-sync health inside the dashboard.
 - Opens on a history-driven bucket homepage with the newest classified capture.
-- Searches text, filenames and AI-generated image descriptions with SQLite FTS5.
+- Searches original text, OCR, documents, transcripts, link metadata and
+  filenames with SQLite FTS5.
+- Explains why each result matched and whether every part has been indexed.
 - Organises results by topic, type and date.
 - Carries topic context across adjacent parts of the same long capture.
 - Lets you star useful items, add private notes and correct a topic.
@@ -77,7 +84,20 @@ chmod +x run.sh
 ```
 
 Open `http://127.0.0.1:8501`. The dashboard starts the live watcher in the
-background and catches up on anything missed while it was closed.
+background, catches up on anything missed while it was closed and progressively
+indexes the existing archive.
+
+### 6. Enable local voice transcription
+
+OCR and document extraction work after the normal setup. Voice notes need a
+one-time local whisper.cpp build and model download:
+
+```bash
+./setup_content_tools.sh
+```
+
+The model runs locally with Apple Metal acceleration. No audio is sent to a
+hosted transcription service.
 
 ## Optional local AI
 
@@ -111,6 +131,10 @@ Credential masking is a display safeguard, not encryption: the original message
 still exists in Telegram and in the local SQLite archive. Do not use the chat as
 a password manager.
 
+Image, document and audio extraction remain on the Mac. Link metadata requires
+an HTTP request to the saved public URL; credential-bearing, private-network and
+already-protected links are never fetched.
+
 ## Tests
 
 ```bash
@@ -119,8 +143,9 @@ a password manager.
 
 ## Current limits
 
-- PDFs and voice notes are stored, but their contents are not yet extracted or
-  transcribed.
+- JavaScript-only or login-protected pages may expose only their original URL.
+- Animated GIF text and uncommon proprietary document formats remain
+  filename-searchable when no safe local extractor is available.
 - Private chat deep links are inconsistent, so results show the Telegram message
   ID.
 - Semantic search uses a local brute-force vector scan, which is suitable for a

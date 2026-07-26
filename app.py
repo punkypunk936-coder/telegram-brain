@@ -12,8 +12,11 @@ from urllib.parse import urlparse
 import streamlit as st
 
 from service_control import (
+    indexer_snapshot,
+    start_content_indexer,
     start_incremental_sync,
     start_watcher,
+    stop_content_indexer,
     stop_watcher,
     watcher_snapshot,
 )
@@ -107,7 +110,7 @@ st.markdown(
 
         .metric-grid {
             display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(5, minmax(0, 1fr));
             gap: 1rem;
             margin: 0.95rem 0 1.1rem;
         }
@@ -261,6 +264,14 @@ def parse_urls(row: dict) -> list[str]:
     return [value for value in values if isinstance(value, str)]
 
 
+def parse_link_metadata(row: dict) -> list[dict]:
+    try:
+        values = json.loads(row.get("link_metadata_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [value for value in values if isinstance(value, dict)]
+
+
 def format_date(value: str) -> str:
     try:
         parsed = datetime.fromisoformat(value)
@@ -295,9 +306,29 @@ def result_title(row: dict) -> str:
         )
         first_line = re.sub(r"^#{1,6}\s+", "", first_line)
         if first_line.startswith(("http://", "https://")):
+            metadata_title = next(
+                (
+                    item.get("title")
+                    for item in parse_link_metadata(row)
+                    if item.get("title")
+                ),
+                None,
+            )
+            if metadata_title:
+                return clean_preview(str(metadata_title), 100)
             host = urlparse(first_line).netloc.replace("www.", "")
             return f"Link from {host}" if host else "Saved link"
         return clean_preview(first_line, 100)
+    metadata_title = next(
+        (
+            item.get("title")
+            for item in parse_link_metadata(row)
+            if item.get("title")
+        ),
+        None,
+    )
+    if metadata_title:
+        return clean_preview(str(metadata_title), 100)
     if row.get("file_name"):
         return row["file_name"]
     kind = row.get("media_type")
@@ -312,6 +343,17 @@ def process_scope(rows: list[dict], scope: str) -> list[dict]:
     if scope == "Media":
         return [row for row in rows if row.get("media_path")]
     return rows
+
+
+def index_label(row: dict) -> tuple[str, str]:
+    status = row.get("content_status") or "indexing"
+    if status == "ready":
+        return "Fully indexed", "green"
+    if status == "indexing":
+        return "Still indexing", "blue"
+    if status == "partial":
+        return "Partially indexed", "orange"
+    return "Index needs attention", "red"
 
 
 def service_age(timestamp: str | None) -> str:
@@ -348,15 +390,21 @@ if "service_bootstrapped" not in st.session_state:
         "on",
     }:
         start_watcher(config)
+    if config.enable_content_indexing:
+        start_content_indexer(config)
     st.session_state.service_bootstrapped = True
 
 stats = connection.execute(
     """
     SELECT
-        COUNT(*) AS total,
+        COUNT(DISTINCT COALESCE(capture_id, chat_id || ':' || message_id))
+            AS total,
+        COUNT(*) AS messages,
         SUM(CASE WHEN is_sensitive = 1 THEN 1 ELSE 0 END) AS sensitive,
         SUM(CASE WHEN media_path IS NOT NULL THEN 1 ELSE 0 END) AS media,
         SUM(CASE WHEN urls_json != '[]' THEN 1 ELSE 0 END) AS links,
+        SUM(CASE WHEN content_status = 'ready' THEN 1 ELSE 0 END)
+            AS indexed,
         MAX(date_utc) AS latest
     FROM messages
     """
@@ -369,7 +417,7 @@ bucket_rows = [
     dict(row)
     for row in connection.execute(
         """
-        WITH classified AS (
+        WITH members AS (
             SELECT
                 m.id,
                 m.message_id,
@@ -377,10 +425,57 @@ bucket_rows = [
                 m.text,
                 m.media_type,
                 m.file_name,
-                COALESCE(s.user_category, m.category) AS display_category
+                m.link_metadata_json,
+                COALESCE(
+                    m.capture_id,
+                    m.chat_id || ':' || m.message_id
+                ) AS capture_key,
+                COALESCE(s.user_category, m.category) AS display_category,
+                ROW_NUMBER() OVER (
+                    PARTITION BY COALESCE(
+                        m.capture_id,
+                        m.chat_id || ':' || m.message_id
+                    )
+                    ORDER BY
+                        CASE
+                            WHEN s.user_category IS NOT NULL THEN 0
+                            WHEN m.category NOT IN (
+                                'Uncategorised', 'Images & Media',
+                                'Documents', 'Links & References'
+                            ) THEN 1
+                            ELSE 2
+                        END,
+                        m.capture_position,
+                        m.message_id
+                ) AS member_rank,
+                MAX(m.date_utc) OVER (
+                    PARTITION BY COALESCE(
+                        m.capture_id,
+                        m.chat_id || ':' || m.message_id
+                    )
+                ) AS capture_date,
+                MAX(m.message_id) OVER (
+                    PARTITION BY COALESCE(
+                        m.capture_id,
+                        m.chat_id || ':' || m.message_id
+                    )
+                ) AS capture_message_id
             FROM messages m
             LEFT JOIN item_state s ON s.message_row_id = m.id
             WHERE m.is_sensitive = 0
+        ),
+        classified AS (
+            SELECT
+                id,
+                capture_message_id AS message_id,
+                capture_date AS date_utc,
+                text,
+                media_type,
+                file_name,
+                link_metadata_json,
+                display_category
+            FROM members
+            WHERE member_rank = 1
         ),
         ranked AS (
             SELECT
@@ -411,44 +506,15 @@ available_topics = [
 if st.session_state.get("topic_filter") not in available_topics:
     st.session_state.topic_filter = "All topics"
 
-latest_row_result = connection.execute(
-    """
-    SELECT
-        m.*,
-        COALESCE(s.starred, 0) AS starred,
-        COALESCE(s.note, '') AS note,
-        s.user_category,
-        COALESCE(s.user_category, m.category) AS display_category
-    FROM messages m
-    LEFT JOIN item_state s ON s.message_row_id = m.id
-    WHERE m.is_sensitive = 0
-    ORDER BY m.date_utc DESC, m.message_id DESC
-    LIMIT 1
-    """
-).fetchone()
-latest_row = dict(latest_row_result) if latest_row_result else None
-latest_capture_rows = []
-if latest_row:
-    latest_capture_rows = [
-        dict(row)
-        for row in connection.execute(
-            """
-            SELECT
-                m.*,
-                COALESCE(s.user_category, m.category) AS display_category
-            FROM messages m
-            LEFT JOIN item_state s ON s.message_row_id = m.id
-            WHERE m.is_sensitive = 0
-              AND m.date_utc = ?
-              AND COALESCE(s.user_category, m.category) = ?
-            ORDER BY m.message_id
-            """,
-            (
-                latest_row["date_utc"],
-                latest_row["display_category"],
-            ),
-        ).fetchall()
-    ]
+latest_results = search(
+    connection,
+    config,
+    "",
+    "all",
+    1,
+    include_sensitive=False,
+)
+latest_row = latest_results[0] if latest_results else None
 
 with st.sidebar:
     st.markdown("### Library")
@@ -510,6 +576,54 @@ with st.sidebar:
                 st.toast("Background catch-up started.")
 
     sync_status_panel()
+
+    st.divider()
+
+    index_snapshot = indexer_snapshot(config)
+    indexed_total = int(stats["indexed"] or 0)
+    message_total = int(stats["messages"] or 0)
+    if index_snapshot["alive"]:
+        st.markdown(
+            '<div class="sync-online">Content indexer online</div>',
+            unsafe_allow_html=True,
+        )
+        st.progress(
+            indexed_total / max(message_total, 1),
+            text=(
+                f"{indexed_total:,} of {message_total:,} messages "
+                "fully indexed"
+            ),
+        )
+        if index_snapshot["current"]:
+            st.caption("Reading " + index_snapshot["current"])
+        st.caption(
+            f"{index_snapshot['partial']:,} partial · "
+            f"{index_snapshot['failed']:,} unavailable"
+        )
+        if st.button(
+            "Pause content indexing",
+            icon=":material/pause:",
+            width="stretch",
+        ):
+            stop_content_indexer(config)
+            st.rerun()
+    else:
+        st.markdown(
+            '<div class="sync-offline">Content indexer offline</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"{indexed_total:,} full · "
+            f"{index_snapshot['partial']:,} partial · "
+            f"{index_snapshot['failed']:,} unavailable"
+        )
+        if st.button(
+            "Resume content indexing",
+            icon=":material/play_arrow:",
+            width="stretch",
+        ):
+            start_content_indexer(config)
+            st.rerun()
 
     st.divider()
 
@@ -592,12 +706,16 @@ st.markdown(
     """
     <div class="metric-grid">
         <div class="metric-item">
-            <div class="metric-label">Messages</div>
-            <div class="metric-value">{messages:,}</div>
+            <div class="metric-label">Captures</div>
+            <div class="metric-value">{captures:,}</div>
         </div>
         <div class="metric-item">
             <div class="metric-label">Saved</div>
             <div class="metric-value">{saved:,}</div>
+        </div>
+        <div class="metric-item">
+            <div class="metric-label">Messages indexed</div>
+            <div class="metric-value">{indexed:,}</div>
         </div>
         <div class="metric-item">
             <div class="metric-label">Attachments</div>
@@ -609,8 +727,9 @@ st.markdown(
         </div>
     </div>
     """.format(
-        messages=stats["total"],
+        captures=stats["total"],
         saved=starred_count,
+        indexed=stats["indexed"] or 0,
         media=stats["media"] or 0,
         links=stats["links"] or 0,
     ),
@@ -640,18 +759,12 @@ if home_mode:
             latest_category = (
                 latest_row.get("display_category") or "Uncategorised"
             )
-            capture_rows = latest_capture_rows or [latest_row]
-            latest_text = "\n\n".join(
-                mask_sensitive_text(row.get("text") or "").strip()
-                for row in capture_rows
-                if (row.get("text") or "").strip()
-            )
-            title_row = capture_rows[0]
-            title_text = mask_sensitive_text(
-                title_row.get("text") or ""
+            latest_text = mask_sensitive_text(
+                latest_row.get("text") or ""
             ).strip()
+            title_text = latest_text
             latest_title = result_title(
-                {**title_row, "text": title_text}
+                {**latest_row, "text": title_text}
             )
             latest_preview = latest_text
             first_line = next(
@@ -673,8 +786,8 @@ if home_mode:
                     unsafe_allow_html=True,
                 )
                 capture_meta = (
-                    f"{len(capture_rows)} linked messages · "
-                    if len(capture_rows) > 1
+                    f"{latest_row.get('capture_size', 1)} linked messages · "
+                    if latest_row.get("capture_size", 1) > 1
                     else ""
                 )
                 st.markdown(
@@ -855,11 +968,28 @@ if total_pages > 1:
             st.rerun()
 
 for row in page_rows:
-    media_path = row.get("media_path")
-    media = Path(media_path) if media_path else None
-    media_exists = bool(media and media.exists())
-    media_type = row.get("media_type")
+    media_items = row.get("media_items") or []
+    if not media_items and row.get("media_path"):
+        media_items = [
+            {
+                "id": row["id"],
+                "path": row["media_path"],
+                "media_type": row.get("media_type"),
+                "file_name": row.get("file_name"),
+                "mime_type": row.get("mime_type"),
+            }
+        ]
+    existing_media = [
+        {**item, "_path": Path(item["path"])}
+        for item in media_items
+        if item.get("path") and Path(item["path"]).exists()
+    ]
+    media_exists = bool(existing_media)
+    media = existing_media[0]["_path"] if existing_media else None
     text = mask_sensitive_text(row.get("text") or "").strip()
+    extracted_text = mask_sensitive_text(
+        row.get("extracted_text") or ""
+    ).strip()
     title = result_title({**row, "text": text})
     urls = parse_urls(row)
     category = row.get("display_category") or row.get("category")
@@ -869,13 +999,19 @@ for row in page_rows:
         main, action = st.columns([12, 1], vertical_alignment="top")
         with main:
             st.badge(category, color="gray")
+            status_label, status_color = index_label(row)
+            st.badge(status_label, color=status_color)
             st.markdown(
                 f'<div class="result-title">{html.escape(title)}</div>',
                 unsafe_allow_html=True,
             )
             meta_bits = [
                 format_date(row.get("date_utc")),
-                f"message {row.get('message_id')}",
+                (
+                    f"{row.get('capture_size')} Telegram messages"
+                    if row.get("capture_size", 1) > 1
+                    else f"message {row.get('message_id')}"
+                ),
             ]
             if row.get("sender_name"):
                 meta_bits.append(str(row["sender_name"]))
@@ -908,21 +1044,39 @@ for row in page_rows:
                 )
                 st.rerun()
 
-        if media_exists and media_type == "image":
+        images = [
+            item
+            for item in existing_media
+            if item.get("media_type") == "image"
+        ]
+        if len(images) == 1:
             media_col, text_col = st.columns(
                 [1, 2.2],
                 vertical_alignment="top",
             )
             with media_col:
-                st.image(str(media), width="stretch")
+                st.image(str(images[0]["_path"]), width="stretch")
             with text_col:
                 if text:
                     st.write(clean_preview(text))
+                elif extracted_text:
+                    st.write(clean_preview(extracted_text))
                 else:
                     st.caption("Image saved without a caption.")
+        elif images:
+            image_columns = st.columns(min(3, len(images)))
+            for index, item in enumerate(images[:6]):
+                with image_columns[index % len(image_columns)]:
+                    st.image(str(item["_path"]), width="stretch")
+            if text:
+                st.write(clean_preview(text))
+            elif extracted_text:
+                st.write(clean_preview(extracted_text))
         else:
             if text:
                 st.write(clean_preview(text))
+            elif extracted_text:
+                st.write(clean_preview(extracted_text))
             elif media_exists:
                 st.caption(media.name)
             else:
@@ -932,11 +1086,19 @@ for row in page_rows:
             with st.expander("Read full text"):
                 st.write(text)
 
-        if media_exists and media_type == "video":
-            with st.expander("Play video"):
-                st.video(str(media))
-        elif media_exists and media_type == "audio":
-            st.audio(str(media))
+        playable = [
+            item
+            for item in existing_media
+            if item.get("media_type") in {"video", "audio"}
+        ]
+        for item in playable:
+            if item.get("media_type") == "video":
+                with st.expander(
+                    "Play " + (item.get("file_name") or "video")
+                ):
+                    st.video(str(item["_path"]))
+            else:
+                st.audio(str(item["_path"]))
 
         if urls or media_exists or note:
             utility_columns = st.columns(
@@ -960,7 +1122,7 @@ for row in page_rows:
                             "Local copy",
                             data=media.read_bytes(),
                             file_name=media.name,
-                            mime=row.get("mime_type")
+                            mime=existing_media[0].get("mime_type")
                             or "application/octet-stream",
                             icon=":material/download:",
                             key=f"download-{row['id']}",
@@ -972,6 +1134,32 @@ for row in page_rows:
             if note and utility_index < len(utility_columns):
                 with utility_columns[utility_index]:
                     st.caption(f"Note: {clean_preview(note, 120)}")
+
+        with st.expander("Why this result"):
+            for reason in row.get("_match_reasons") or [
+                "Shown by the current library filters"
+            ]:
+                st.markdown(f"- {reason}")
+            if row.get("content_status") == "ready":
+                st.caption(
+                    "All available text, files, media and links in this "
+                    "capture have been checked."
+                )
+            elif row.get("content_status") == "indexing":
+                st.caption(
+                    "This capture is still being read in the background. "
+                    "Search coverage will improve automatically."
+                )
+            else:
+                st.caption(
+                    "Some content could not be read. The original Telegram "
+                    "text, filenames and URLs remain searchable."
+                )
+                if row.get("content_error"):
+                    st.caption(clean_preview(row["content_error"], 280))
+            if extracted_text:
+                st.markdown("**Indexed content preview**")
+                st.write(clean_preview(extracted_text, 900))
 
         with st.expander("Organise"):
             editor_left, editor_right = st.columns([1, 2])

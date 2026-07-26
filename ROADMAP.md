@@ -7,6 +7,10 @@ filing.
 
 ## First: Make every saved item retrievable
 
+Status: implemented in the first indexing release. The system now performs
+local OCR and document/audio extraction, captures link metadata, unifies
+adjacent message parts and explains search coverage.
+
 ### 1. Full-content indexing
 
 Extract text from PDFs and documents, OCR images, transcribe voice notes and
