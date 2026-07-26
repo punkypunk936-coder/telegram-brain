@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "data" / "logs"
 WATCHER_LOG = LOG_DIR / "watcher.log"
 SYNC_LOG = LOG_DIR / "sync.log"
+INDEXER_LOG = LOG_DIR / "content_indexer.log"
 
 
 def process_alive(pid: int | str | None) -> bool:
@@ -48,6 +49,36 @@ def watcher_snapshot(config: Settings) -> dict:
         "error_at": error_at,
         "last_count": int(last_count) if last_count else 0,
         "last_count_at": last_count_at,
+    }
+
+
+def indexer_snapshot(config: Settings) -> dict:
+    connection = db(config.db_path)
+    status, status_at = get_runtime_state(connection, "indexer_status")
+    pid, _ = get_runtime_state(connection, "indexer_pid")
+    error, error_at = get_runtime_state(connection, "indexer_error")
+    current, _ = get_runtime_state(connection, "indexer_current")
+    pending, _ = get_runtime_state(connection, "indexer_pending")
+    ready, _ = get_runtime_state(connection, "indexer_ready")
+    partial, _ = get_runtime_state(connection, "indexer_partial")
+    failed, _ = get_runtime_state(connection, "indexer_failed")
+    connection.close()
+
+    alive = process_alive(pid)
+    if not alive and status in {"online", "starting"}:
+        status = "offline"
+    return {
+        "status": status or "offline",
+        "status_at": status_at,
+        "pid": int(pid) if pid and pid.isdigit() else None,
+        "alive": alive,
+        "error": error,
+        "error_at": error_at,
+        "current": current,
+        "pending": int(pending) if pending else 0,
+        "ready": int(ready) if ready else 0,
+        "partial": int(partial) if partial else 0,
+        "failed": int(failed) if failed else 0,
     }
 
 
@@ -90,6 +121,34 @@ def stop_watcher(config: Settings) -> bool:
     os.kill(snapshot["pid"], signal.SIGTERM)
     connection = db(config.db_path)
     set_runtime_state(connection, "watcher_status", "offline")
+    connection.close()
+    return True
+
+
+def start_content_indexer(
+    config: Settings,
+) -> tuple[bool, int | None]:
+    snapshot = indexer_snapshot(config)
+    if snapshot["alive"]:
+        return False, snapshot["pid"]
+    connection = db(config.db_path)
+    set_runtime_state(connection, "indexer_status", "starting")
+    set_runtime_state(connection, "indexer_error", "")
+    connection.close()
+    pid = _spawn("content_worker.py", INDEXER_LOG)
+    connection = db(config.db_path)
+    set_runtime_state(connection, "indexer_pid", pid)
+    connection.close()
+    return True, pid
+
+
+def stop_content_indexer(config: Settings) -> bool:
+    snapshot = indexer_snapshot(config)
+    if not snapshot["alive"] or not snapshot["pid"]:
+        return False
+    os.kill(snapshot["pid"], signal.SIGTERM)
+    connection = db(config.db_path)
+    set_runtime_state(connection, "indexer_status", "offline")
     connection.close()
     return True
 

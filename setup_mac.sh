@@ -12,5 +12,5 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 [ -f .env ] || cp .env.example .env
 mkdir -p data/media data/logs
-chmod +x run.sh
+chmod +x run.sh setup_content_tools.sh
 echo 'Setup complete. Edit .env, then run: python list_chats.py'

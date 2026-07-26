@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +21,10 @@ from telethon import TelegramClient
 load_dotenv()
 
 URL_RE = re.compile(r"https?://[^\s<>\]\)]+", re.IGNORECASE)
-METADATA_VERSION = 7
+METADATA_VERSION = 8
+ENRICHMENT_VERSION = 1
+CAPTURE_VERSION = 1
+_INITIALIZED_DATABASES: set[str] = set()
 
 SECRET_PATTERNS = (
     (
@@ -279,6 +283,10 @@ class Settings:
     ollama_url: str
     embed_model: str
     vision_model: str
+    enable_content_indexing: bool = True
+    content_poll_seconds: int = 8
+    whisper_command: str | None = None
+    whisper_model_path: Path | None = None
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -336,6 +344,17 @@ def settings(require_chat: bool = False) -> Settings:
             "OLLAMA_EMBED_MODEL", "embeddinggemma"
         ),
         vision_model=os.getenv("OLLAMA_VISION_MODEL", "gemma3:4b"),
+        enable_content_indexing=env_bool("ENABLE_CONTENT_INDEXING", True),
+        content_poll_seconds=max(
+            2,
+            int(os.getenv("CONTENT_POLL_SECONDS", "8")),
+        ),
+        whisper_command=os.getenv("WHISPER_COMMAND") or None,
+        whisper_model_path=(
+            Path(os.getenv("WHISPER_MODEL_PATH", "")).expanduser().resolve()
+            if os.getenv("WHISPER_MODEL_PATH", "").strip()
+            else None
+        ),
     )
 
 
@@ -365,6 +384,16 @@ CREATE TABLE IF NOT EXISTS messages(
     vision_text TEXT NOT NULL DEFAULT '',
     indexed_text TEXT NOT NULL DEFAULT '',
     embedding_json TEXT,
+    extracted_text TEXT NOT NULL DEFAULT '',
+    link_metadata_json TEXT NOT NULL DEFAULT '[]',
+    content_status TEXT NOT NULL DEFAULT 'pending',
+    content_error TEXT NOT NULL DEFAULT '',
+    enrichment_version INTEGER NOT NULL DEFAULT 0,
+    enriched_at TEXT,
+    telegram_group_id TEXT,
+    capture_id TEXT,
+    capture_position INTEGER NOT NULL DEFAULT 0,
+    capture_version INTEGER NOT NULL DEFAULT 0,
     category TEXT NOT NULL DEFAULT 'Uncategorised',
     is_sensitive INTEGER NOT NULL DEFAULT 0,
     sensitive_reason TEXT,
@@ -448,6 +477,16 @@ def _migrate(connection: sqlite3.Connection) -> None:
         "is_sensitive": "INTEGER NOT NULL DEFAULT 0",
         "sensitive_reason": "TEXT",
         "metadata_version": "INTEGER NOT NULL DEFAULT 0",
+        "extracted_text": "TEXT NOT NULL DEFAULT ''",
+        "link_metadata_json": "TEXT NOT NULL DEFAULT '[]'",
+        "content_status": "TEXT NOT NULL DEFAULT 'pending'",
+        "content_error": "TEXT NOT NULL DEFAULT ''",
+        "enrichment_version": "INTEGER NOT NULL DEFAULT 0",
+        "enriched_at": "TEXT",
+        "telegram_group_id": "TEXT",
+        "capture_id": "TEXT",
+        "capture_position": "INTEGER NOT NULL DEFAULT 0",
+        "capture_version": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, definition in additions.items():
         if name not in columns:
@@ -460,17 +499,34 @@ def _migrate(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_sensitive ON messages(is_sensitive)"
     )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_capture_id ON messages(capture_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_content_status "
+        "ON messages(content_status)"
+    )
     connection.commit()
 
 
 def db(path: Path | str) -> sqlite3.Connection:
-    connection = sqlite3.connect(path, timeout=15)
+    resolved = str(Path(path).resolve())
+    connection = sqlite3.connect(resolved, timeout=30)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout=15000")
-    connection.executescript(SCHEMA)
-    _migrate(connection)
-    refresh_metadata(connection)
+    connection.execute("PRAGMA busy_timeout=30000")
+    if resolved not in _INITIALIZED_DATABASES:
+        connection.executescript(SCHEMA)
+        _migrate(connection)
+        rebuild_captures(connection)
+        _INITIALIZED_DATABASES.add(resolved)
     return connection
+
+
+def rebuild_search_index(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+    )
+    connection.commit()
 
 
 def ollama_post(url: str, payload: dict, timeout: int = 180) -> dict:
@@ -585,9 +641,19 @@ def detect_category(
     vision_text: str | None = None,
     file_name: str | None = None,
     media_type: str | None = None,
+    extracted_text: str | None = None,
+    link_text: str | None = None,
 ) -> str:
     combined = " ".join(
-        value for value in (text, vision_text, file_name) if value
+        value
+        for value in (
+            text,
+            vision_text,
+            extracted_text,
+            link_text,
+            file_name,
+        )
+        if value
     ).lower()
     tokens = {
         token.strip(".-")
@@ -632,9 +698,54 @@ def detect_category(
     return "Uncategorised"
 
 
+def link_metadata_text(value: str | None) -> str:
+    try:
+        records = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    pieces = []
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict):
+            continue
+        pieces.extend(
+            str(record.get(key) or "")
+            for key in ("title", "description", "site_name")
+        )
+    return "\n".join(piece for piece in pieces if piece)
+
+
+def build_indexed_text(record: dict) -> str:
+    try:
+        urls = json.loads(record.get("urls_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        urls = []
+    if not isinstance(urls, list):
+        urls = []
+    values = (
+        record.get("text") or "",
+        record.get("vision_text") or "",
+        record.get("extracted_text") or "",
+        link_metadata_text(record.get("link_metadata_json")),
+        record.get("file_name") or "",
+        *(str(url) for url in urls if isinstance(url, str)),
+    )
+    return "\n".join(value.strip() for value in values if value.strip())
+
+
 def message_metadata(record: dict) -> dict:
+    link_text = link_metadata_text(record.get("link_metadata_json"))
+    searchable_content = "\n".join(
+        value
+        for value in (
+            record.get("text"),
+            record.get("vision_text"),
+            record.get("extracted_text"),
+            link_text,
+        )
+        if value
+    )
     is_sensitive, reason = sensitive_status(
-        record.get("text"),
+        searchable_content,
         record.get("file_name"),
     )
     category = detect_category(
@@ -642,6 +753,8 @@ def message_metadata(record: dict) -> dict:
         record.get("vision_text"),
         record.get("file_name"),
         record.get("media_type"),
+        record.get("extracted_text"),
+        link_text,
     )
     return {
         "category": category,
@@ -661,6 +774,134 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _capture_contextual(row: dict) -> bool:
+    text = (row.get("text") or "").strip()
+    category = row.get("category") or "Uncategorised"
+    return (
+        len(text) >= 80
+        or bool(row.get("media_type"))
+        or category
+        not in {
+            "Uncategorised",
+            "Images & Media",
+            "Documents",
+            "Links & References",
+        }
+    )
+
+
+def _belongs_to_capture(previous: dict, current: dict) -> bool:
+    previous_group = previous.get("telegram_group_id")
+    current_group = current.get("telegram_group_id")
+    if previous_group and previous_group == current_group:
+        return True
+
+    previous_time = _parse_timestamp(previous.get("date_utc"))
+    current_time = _parse_timestamp(current.get("date_utc"))
+    if not previous_time or not current_time:
+        return False
+    gap = (current_time - previous_time).total_seconds()
+    message_gap = int(current.get("message_id") or 0) - int(
+        previous.get("message_id") or 0
+    )
+    if gap < 0 or message_gap <= 0:
+        return False
+    if gap == 0 and message_gap <= 10:
+        return True
+    if gap > 120 or message_gap > 5:
+        return False
+
+    previous_category = previous.get("category") or "Uncategorised"
+    current_category = current.get("category") or "Uncategorised"
+    same_specific_topic = (
+        previous_category == current_category
+        and previous_category
+        not in {
+            "Uncategorised",
+            "Images & Media",
+            "Documents",
+            "Links & References",
+        }
+    )
+    media_pair = bool(previous.get("media_type")) != bool(
+        current.get("media_type")
+    )
+    long_continuation = (
+        len((previous.get("text") or "").strip()) >= 80
+        and len((current.get("text") or "").strip()) >= 80
+    )
+    return (
+        gap <= 45
+        and (
+            same_specific_topic
+            or media_pair
+            or long_continuation
+            or (
+                _capture_contextual(previous)
+                and _capture_contextual(current)
+                and gap <= 15
+            )
+        )
+    )
+
+
+def rebuild_captures(
+    connection: sqlite3.Connection,
+    chat_id: int | None = None,
+) -> int:
+    clauses = ""
+    params: list = []
+    if chat_id is not None:
+        clauses = "WHERE chat_id = ?"
+        params.append(chat_id)
+    rows = [
+        dict(row)
+        for row in connection.execute(
+            f"""
+            SELECT id, chat_id, message_id, date_utc, text, media_type,
+                   category, telegram_group_id, capture_id,
+                   capture_position, capture_version
+            FROM messages
+            {clauses}
+            ORDER BY chat_id, date_utc, message_id
+            """,
+            params,
+        ).fetchall()
+    ]
+    updates = []
+    previous = None
+    root_message_id = None
+    position = 0
+    for row in rows:
+        same_chat = previous and previous["chat_id"] == row["chat_id"]
+        if same_chat and _belongs_to_capture(previous, row):
+            position += 1
+        else:
+            root_message_id = row["message_id"]
+            position = 0
+        capture_id = f"{row['chat_id']}:{root_message_id}"
+        if (
+            row.get("capture_id") != capture_id
+            or int(row.get("capture_position") or 0) != position
+            or int(row.get("capture_version") or 0) != CAPTURE_VERSION
+        ):
+            updates.append(
+                (capture_id, position, CAPTURE_VERSION, row["id"])
+            )
+        previous = row
+    if updates:
+        connection.executemany(
+            """
+            UPDATE messages
+            SET capture_id = ?, capture_position = ?, capture_version = ?
+            WHERE id = ?
+            """,
+            updates,
+        )
+        connection.commit()
+    return len(updates)
 
 
 def _inherited_category(
@@ -712,7 +953,8 @@ def refresh_metadata(connection: sqlite3.Connection) -> int:
     rows = connection.execute(
         """
         SELECT id, chat_id, message_id, date_utc, sender_name, text,
-               vision_text, file_name, media_type
+               vision_text, extracted_text, link_metadata_json,
+               file_name, media_type
         FROM messages
         WHERE metadata_version < ?
         ORDER BY date_utc, message_id
@@ -765,6 +1007,54 @@ def refresh_metadata(connection: sqlite3.Connection) -> int:
 
 def upsert(connection: sqlite3.Connection, record: dict) -> None:
     enriched = dict(record)
+    existing = connection.execute(
+        """
+        SELECT media_path, urls_json, vision_text, extracted_text,
+               link_metadata_json, content_status, content_error,
+               enrichment_version, enriched_at, embedding_json
+        FROM messages
+        WHERE chat_id = ? AND message_id = ?
+        """,
+        (enriched.get("chat_id"), enriched.get("message_id")),
+    ).fetchone()
+    same_sources = bool(
+        existing
+        and (existing["media_path"] or "") == (enriched.get("media_path") or "")
+        and (existing["urls_json"] or "[]")
+        == (enriched.get("urls_json") or "[]")
+    )
+    if same_sources:
+        for field in (
+            "extracted_text",
+            "link_metadata_json",
+            "content_status",
+            "content_error",
+            "enrichment_version",
+            "enriched_at",
+            "embedding_json",
+        ):
+            if enriched.get(field) in {None, "", "[]"}:
+                enriched[field] = existing[field]
+        if not enriched.get("vision_text"):
+            enriched["vision_text"] = existing["vision_text"]
+    else:
+        enriched.setdefault("extracted_text", "")
+        enriched.setdefault("link_metadata_json", "[]")
+        enriched["content_status"] = "pending"
+        enriched["content_error"] = ""
+        enriched["enrichment_version"] = 0
+        enriched["enriched_at"] = None
+        enriched["embedding_json"] = None
+
+    enriched.setdefault("vision_text", "")
+    enriched.setdefault("extracted_text", "")
+    enriched.setdefault("link_metadata_json", "[]")
+    enriched.setdefault("content_status", "pending")
+    enriched.setdefault("content_error", "")
+    enriched.setdefault("enrichment_version", 0)
+    enriched.setdefault("capture_position", 0)
+    enriched.setdefault("capture_version", 0)
+    enriched["indexed_text"] = build_indexed_text(enriched)
     enriched.update(message_metadata(enriched))
     inherited = _inherited_category(connection, enriched)
     if inherited:
@@ -783,6 +1073,16 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         "vision_text",
         "indexed_text",
         "embedding_json",
+        "extracted_text",
+        "link_metadata_json",
+        "content_status",
+        "content_error",
+        "enrichment_version",
+        "enriched_at",
+        "telegram_group_id",
+        "capture_id",
+        "capture_position",
+        "capture_version",
         "category",
         "is_sensitive",
         "sensitive_reason",
@@ -803,6 +1103,7 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         [enriched.get(column) for column in columns],
     )
     connection.commit()
+    rebuild_captures(connection, enriched.get("chat_id"))
 
 
 async def ingest(
@@ -865,35 +1166,6 @@ async def ingest(
     text = message.raw_text or ""
     urls = URL_RE.findall(text)
     kind = media_kind(path, mime_type)
-    vision_text = ""
-
-    if (
-        config.enable_vision
-        and kind == "image"
-        and path
-        and Path(path).suffix.lower() != ".gif"
-    ):
-        try:
-            vision_text = describe(config, path)
-        except Exception as error:
-            print("[vision skipped]", message.id, error)
-
-    indexed_text = "\n".join(
-        value
-        for value in (
-            text,
-            vision_text,
-            file_name or "",
-            *urls,
-        )
-        if value
-    )
-    embedding_json = None
-    if config.enable_embeddings and indexed_text:
-        try:
-            embedding_json = json.dumps(embed(config, indexed_text))
-        except Exception as error:
-            print("[embedding skipped]", message.id, error)
 
     upsert(
         connection,
@@ -908,9 +1180,14 @@ async def ingest(
             "file_name": file_name,
             "mime_type": mime_type,
             "urls_json": json.dumps(urls),
-            "vision_text": vision_text,
-            "indexed_text": indexed_text,
-            "embedding_json": embedding_json,
+            "vision_text": "",
+            "indexed_text": "",
+            "embedding_json": None,
+            "telegram_group_id": (
+                str(message.grouped_id)
+                if getattr(message, "grouped_id", None)
+                else None
+            ),
         },
     )
     return True
@@ -930,8 +1207,27 @@ def cosine(left: list[float], right: list[float]) -> float:
 
 def _fts_query(query: str) -> str:
     tokens = re.findall(r"[\w+#.-]+", query.lower(), re.UNICODE)
-    clean = [token.replace('"', "") for token in tokens if token.strip(".-")]
-    return " OR ".join(f'"{token}"*' for token in clean[:12])
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "for",
+        "from",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+    clean = [
+        token.replace('"', "")
+        for token in tokens
+        if len(token.strip(".-")) >= 2 and token not in stopwords
+    ]
+    return " AND ".join(f'"{token}"*' for token in clean[:12])
 
 
 def _base_filters(
@@ -955,6 +1251,264 @@ def _base_filters(
     if starred_only:
         clauses.append("COALESCE(s.starred, 0) = 1")
     return clauses, params
+
+
+def _query_terms(query: str) -> list[str]:
+    return [
+        token.lower()
+        for token in re.findall(r"[\w+#.-]+", query, re.UNICODE)
+        if len(token.strip(".-")) >= 2
+    ][:12]
+
+
+def _match_reasons(parts: list[dict], query: str) -> list[str]:
+    terms = _query_terms(query)
+    if not terms:
+        return ["Shown by the current library filters"]
+
+    reasons = []
+
+    def matched(value: str | None) -> bool:
+        lowered = (value or "").lower()
+        return bool(lowered) and any(term in lowered for term in terms)
+
+    if any(matched(part.get("text")) for part in parts):
+        reasons.append("Matched the original Telegram text")
+    if any(matched(part.get("file_name")) for part in parts):
+        reasons.append("Matched a saved file name")
+    if any(matched(part.get("urls_json")) for part in parts):
+        reasons.append("Matched a saved URL")
+    if any(
+        matched(link_metadata_text(part.get("link_metadata_json")))
+        for part in parts
+    ):
+        reasons.append("Matched a link title or description")
+
+    extracted_types = {
+        part.get("media_type")
+        for part in parts
+        if matched(part.get("extracted_text"))
+    }
+    if "image" in extracted_types:
+        reasons.append("Matched text read from an image")
+    if extracted_types & {"pdf", "document"}:
+        reasons.append("Matched text extracted from a document")
+    if "audio" in extracted_types:
+        reasons.append("Matched a local voice-note transcript")
+    if any(matched(part.get("vision_text")) for part in parts):
+        reasons.append("Matched an AI image description")
+    if not reasons and any(
+        float(part.get("_semantic_score") or 0) > 0 for part in parts
+    ):
+        reasons.append("Related by semantic meaning")
+    return reasons or ["Matched the capture's searchable content"]
+
+
+def _capture_category(parts: list[dict]) -> tuple[str, str | None]:
+    for part in parts:
+        if part.get("user_category"):
+            return str(part["user_category"]), str(part["user_category"])
+    generic = {
+        "Uncategorised",
+        "Images & Media",
+        "Documents",
+        "Links & References",
+    }
+    for part in parts:
+        category = part.get("category")
+        if category and category not in generic:
+            return str(category), None
+    for part in parts:
+        category = part.get("category")
+        if category:
+            return str(category), None
+    return "Uncategorised", None
+
+
+def _combine_capture(parts: list[dict], query: str) -> dict:
+    parts.sort(
+        key=lambda item: (
+            int(item.get("capture_position") or 0),
+            item.get("date_utc") or "",
+            int(item.get("message_id") or 0),
+        )
+    )
+    root = dict(parts[0])
+    latest = max(
+        parts,
+        key=lambda item: (
+            item.get("date_utc") or "",
+            int(item.get("message_id") or 0),
+        ),
+    )
+    category, user_category = _capture_category(parts)
+
+    def unique_values(field: str) -> list[str]:
+        values = []
+        for part in parts:
+            value = (part.get(field) or "").strip()
+            if value and value not in values:
+                values.append(value)
+        return values
+
+    urls = []
+    link_metadata = []
+    media_items = []
+    notes = []
+    for part in parts:
+        try:
+            part_urls = json.loads(part.get("urls_json") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            part_urls = []
+        for url in part_urls if isinstance(part_urls, list) else []:
+            if isinstance(url, str) and url not in urls:
+                urls.append(url)
+        try:
+            metadata = json.loads(part.get("link_metadata_json") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            metadata = []
+        for item in metadata if isinstance(metadata, list) else []:
+            if isinstance(item, dict):
+                link_metadata.append(item)
+        if part.get("media_path"):
+            media_items.append(
+                {
+                    "id": part["id"],
+                    "path": part["media_path"],
+                    "media_type": part.get("media_type"),
+                    "file_name": part.get("file_name"),
+                    "mime_type": part.get("mime_type"),
+                }
+            )
+        note = (part.get("note") or "").strip()
+        if note and note not in notes:
+            notes.append(note)
+
+    statuses = {part.get("content_status") or "pending" for part in parts}
+    if statuses & {"pending", "processing"}:
+        content_status = "indexing"
+    elif statuses == {"ready"}:
+        content_status = "ready"
+    elif statuses == {"failed"}:
+        content_status = "failed"
+    else:
+        content_status = "partial"
+    errors = unique_values("content_error")
+    expected_parts = sum(
+        bool(part.get("media_path"))
+        or (part.get("urls_json") or "[]") != "[]"
+        for part in parts
+    )
+    indexed_parts = sum(
+        (part.get("content_status") or "") == "ready" for part in parts
+    )
+
+    root.update(
+        {
+            "date_utc": latest.get("date_utc"),
+            "message_id": latest.get("message_id"),
+            "root_message_id": parts[0].get("message_id"),
+            "message_ids": [part.get("message_id") for part in parts],
+            "row_ids": [part.get("id") for part in parts],
+            "capture_size": len(parts),
+            "text": "\n\n".join(unique_values("text")),
+            "vision_text": "\n\n".join(unique_values("vision_text")),
+            "extracted_text": "\n\n".join(
+                unique_values("extracted_text")
+            ),
+            "indexed_text": "\n\n".join(unique_values("indexed_text")),
+            "urls_json": json.dumps(urls),
+            "link_metadata_json": json.dumps(link_metadata),
+            "media_items": media_items,
+            "media_path": (
+                media_items[0]["path"] if media_items else None
+            ),
+            "media_type": (
+                media_items[0]["media_type"] if media_items else None
+            ),
+            "file_name": (
+                media_items[0]["file_name"] if media_items else None
+            ),
+            "mime_type": (
+                media_items[0]["mime_type"] if media_items else None
+            ),
+            "starred": int(any(part.get("starred") for part in parts)),
+            "note": "\n".join(notes),
+            "user_category": user_category,
+            "category": category,
+            "display_category": category,
+            "content_status": content_status,
+            "content_error": " · ".join(errors),
+            "_expected_parts": expected_parts,
+            "_indexed_parts": indexed_parts,
+            "_match_reasons": _match_reasons(parts, query),
+            "_keyword_score": max(
+                float(part.get("_keyword_score") or 0) for part in parts
+            ),
+            "_semantic_score": max(
+                float(part.get("_semantic_score") or 0) for part in parts
+            ),
+            "_score": max(float(part.get("_score") or 0) for part in parts),
+        }
+    )
+    return root
+
+
+def collapse_captures(
+    connection: sqlite3.Connection,
+    rows: list[dict],
+    query: str,
+    *,
+    include_sensitive: bool = False,
+) -> list[dict]:
+    if not rows:
+        return []
+    ordered_ids = []
+    scores = {}
+    for row in rows:
+        capture_id = row.get("capture_id") or (
+            f"{row.get('chat_id')}:{row.get('message_id')}"
+        )
+        if capture_id not in ordered_ids:
+            ordered_ids.append(capture_id)
+        scores[row["id"]] = {
+            key: row.get(key, 0)
+            for key in ("_keyword_score", "_semantic_score", "_score")
+        }
+
+    members: list[dict] = []
+    for start in range(0, len(ordered_ids), 400):
+        batch = ordered_ids[start : start + 400]
+        placeholders = ",".join("?" * len(batch))
+        sensitivity = "" if include_sensitive else "AND m.is_sensitive = 0"
+        fetched = connection.execute(
+            f"""
+            SELECT m.*, COALESCE(s.starred, 0) AS starred,
+                   COALESCE(s.note, '') AS note, s.user_category,
+                   COALESCE(s.user_category, m.category)
+                       AS display_category
+            FROM messages m
+            LEFT JOIN item_state s ON s.message_row_id = m.id
+            WHERE m.capture_id IN ({placeholders})
+              {sensitivity}
+            ORDER BY m.capture_id, m.capture_position, m.message_id
+            """,
+            batch,
+        ).fetchall()
+        members.extend(dict(row) for row in fetched)
+
+    grouped: dict[str, list[dict]] = {}
+    for member in members:
+        capture_id = member.get("capture_id") or (
+            f"{member.get('chat_id')}:{member.get('message_id')}"
+        )
+        member.update(scores.get(member["id"], {}))
+        grouped.setdefault(capture_id, []).append(member)
+    return [
+        _combine_capture(grouped[capture_id], query)
+        for capture_id in ordered_ids
+        if capture_id in grouped
+    ]
 
 
 def search(
@@ -991,9 +1545,14 @@ def search(
             ORDER BY m.date_utc DESC, m.message_id DESC
             LIMIT ?
             """,
-            [*filter_params, limit],
+            [*filter_params, max(limit * 4, limit)],
         ).fetchall()
-        return [dict(row) for row in rows]
+        return collapse_captures(
+            connection,
+            [dict(row) for row in rows],
+            query,
+            include_sensitive=include_sensitive,
+        )[:limit]
 
     found: dict[int, dict] = {}
     match_query = _fts_query(query)
@@ -1031,7 +1590,7 @@ def search(
             )
 
     if not found:
-        terms = re.findall(r"[\w+#.-]+", query.lower(), re.UNICODE)[:8]
+        terms = _query_terms(query)[:8]
         if terms:
             like_clause = " OR ".join(
                 "LOWER(m.indexed_text) LIKE ?" for _ in terms
@@ -1096,7 +1655,7 @@ def search(
             0.62 * max(0, item.get("_keyword_score", 0))
             + 0.38 * max(0, item.get("_semantic_score", 0))
         )
-    return sorted(
+    ordered = sorted(
         results,
         key=lambda item: (
             item["_score"],
@@ -1104,6 +1663,12 @@ def search(
             item["message_id"],
         ),
         reverse=True,
+    )
+    return collapse_captures(
+        connection,
+        ordered,
+        query,
+        include_sensitive=include_sensitive,
     )[:limit]
 
 
@@ -1152,17 +1717,25 @@ def set_runtime_state(
     value: str | int | float | bool,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    connection.execute(
-        """
-        INSERT INTO runtime_state(key, value, updated_at)
-        VALUES(?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET
-            value = excluded.value,
-            updated_at = excluded.updated_at
-        """,
-        (key, str(value), now),
-    )
-    connection.commit()
+    for attempt in range(5):
+        try:
+            connection.execute(
+                """
+                INSERT INTO runtime_state(key, value, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, str(value), now),
+            )
+            connection.commit()
+            return
+        except sqlite3.OperationalError as error:
+            connection.rollback()
+            if "locked" not in str(error).lower() or attempt == 4:
+                raise
+            time.sleep(0.2 * (attempt + 1))
 
 
 def get_runtime_state(

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from tgbrain import (
     Settings,
+    build_indexed_text,
     db,
     detect_category,
     mask_sensitive_text,
@@ -195,6 +196,136 @@ class TelegramBrainTests(unittest.TestCase):
         self.insert(21, "second note", date_utc=timestamp)
         rows = search(self.connection, self.config, "", limit=20)
         self.assertEqual(rows[0]["message_id"], 21)
+
+    def test_adjacent_parts_are_returned_as_one_capture(self):
+        timestamp = "2026-07-20T12:00:00+00:00"
+        self.insert(
+            30,
+            "A durable semiconductor thesis with several supporting facts.",
+            date_utc=timestamp,
+        )
+        self.insert(
+            31,
+            "The second part adds positioning and price-action context.",
+            media_type="image",
+            file_name="chart.png",
+            date_utc=timestamp,
+        )
+
+        rows = search(self.connection, self.config, "", limit=20)
+
+        capture = next(row for row in rows if 30 in row["message_ids"])
+        self.assertEqual(capture["capture_size"], 2)
+        self.assertIn(31, capture["message_ids"])
+        self.assertIn("second part", capture["text"])
+
+    def test_extracted_content_survives_a_telegram_resync(self):
+        self.insert(
+            40,
+            "Document caption",
+            media_type="pdf",
+            file_name="research.pdf",
+        )
+        row = self.connection.execute(
+            "SELECT * FROM messages WHERE message_id = 40"
+        ).fetchone()
+        record = dict(row)
+        record["extracted_text"] = "Rare document phrase quartzsignal"
+        record["content_status"] = "ready"
+        record["enrichment_version"] = 1
+        record["indexed_text"] = build_indexed_text(record)
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET extracted_text = ?, content_status = ?,
+                enrichment_version = ?, indexed_text = ?
+            WHERE id = ?
+            """,
+            (
+                record["extracted_text"],
+                record["content_status"],
+                record["enrichment_version"],
+                record["indexed_text"],
+                record["id"],
+            ),
+        )
+        self.connection.commit()
+
+        self.insert(
+            40,
+            "Document caption",
+            media_type="pdf",
+            file_name="research.pdf",
+        )
+        refreshed = self.connection.execute(
+            """
+            SELECT extracted_text, content_status
+            FROM messages
+            WHERE message_id = 40
+            """
+        ).fetchone()
+        self.assertEqual(
+            refreshed["extracted_text"],
+            "Rare document phrase quartzsignal",
+        )
+        self.assertEqual(refreshed["content_status"], "ready")
+
+    def test_search_explains_document_text_match(self):
+        self.insert(
+            50,
+            "A saved PDF",
+            media_type="pdf",
+            file_name="memo.pdf",
+        )
+        row = dict(
+            self.connection.execute(
+                "SELECT * FROM messages WHERE message_id = 50"
+            ).fetchone()
+        )
+        row["extracted_text"] = "The uncommon marker is auroracircuit."
+        row["content_status"] = "ready"
+        row["indexed_text"] = build_indexed_text(row)
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET extracted_text = ?, content_status = ?, indexed_text = ?
+            WHERE id = ?
+            """,
+            (
+                row["extracted_text"],
+                row["content_status"],
+                row["indexed_text"],
+                row["id"],
+            ),
+        )
+        self.connection.commit()
+
+        results = search(
+            self.connection,
+            self.config,
+            "auroracircuit",
+            limit=20,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertIn(
+            "Matched text extracted from a document",
+            results[0]["_match_reasons"],
+        )
+
+    def test_multi_term_search_prefers_complete_match(self):
+        self.insert(60, "Social status can be measured in followers")
+        self.insert(61, "A separate note about social media")
+        self.insert(62, "Another note discussing follower growth")
+
+        results = search(
+            self.connection,
+            self.config,
+            "social status followers",
+            limit=20,
+        )
+
+        self.assertEqual([row["message_id"] for row in results], [60])
 
 
 if __name__ == "__main__":
