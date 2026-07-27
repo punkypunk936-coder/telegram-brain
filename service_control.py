@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from tgbrain import db, get_runtime_state, set_runtime_state, Settings
 
@@ -14,6 +18,7 @@ LOG_DIR = ROOT / "data" / "logs"
 WATCHER_LOG = LOG_DIR / "watcher.log"
 SYNC_LOG = LOG_DIR / "sync.log"
 INDEXER_LOG = LOG_DIR / "content_indexer.log"
+OLLAMA_LOG = LOG_DIR / "ollama.log"
 
 
 def process_alive(pid: int | str | None) -> bool:
@@ -97,12 +102,89 @@ def _spawn(script: str, log_path: Path, *args: str) -> int:
     return process.pid
 
 
+def _ollama_ready(config: Settings) -> bool:
+    try:
+        with urlopen(
+            f"{config.ollama_url}/api/version",
+            timeout=0.8,
+        ) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def ensure_local_ollama(config: Settings) -> bool:
+    if not (config.enable_vision or config.enable_embeddings):
+        return True
+    parsed = urlparse(config.ollama_url)
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return True
+    if _ollama_ready(config):
+        return True
+
+    configured = os.getenv("OLLAMA_COMMAND", "").strip()
+    command = (
+        configured
+        or shutil.which("ollama")
+        or "/Applications/Ollama.app/Contents/Resources/ollama"
+    )
+    if not Path(command).exists():
+        return False
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = OLLAMA_LOG.open("a", encoding="utf-8")
+    subprocess.Popen(
+        [command, "serve"],
+        cwd=ROOT,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+    )
+    log.close()
+    for _ in range(20):
+        if _ollama_ready(config):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def reconcile_services(config: Settings) -> None:
+    connection = db(config.db_path)
+    watcher_desired, _ = get_runtime_state(
+        connection,
+        "watcher_desired",
+    )
+    indexer_desired, _ = get_runtime_state(
+        connection,
+        "indexer_desired",
+    )
+    connection.close()
+
+    auto_watcher = os.getenv("AUTO_START_WATCHER", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if auto_watcher and watcher_desired != "paused":
+        if not watcher_snapshot(config)["alive"]:
+            start_watcher(config)
+    if (
+        config.enable_content_indexing
+        and indexer_desired != "paused"
+        and not indexer_snapshot(config)["alive"]
+    ):
+        start_content_indexer(config)
+
+
 def start_watcher(config: Settings) -> tuple[bool, int | None]:
     snapshot = watcher_snapshot(config)
     if snapshot["alive"]:
         return False, snapshot["pid"]
 
     connection = db(config.db_path)
+    set_runtime_state(connection, "watcher_desired", "online")
     set_runtime_state(connection, "watcher_status", "starting")
     set_runtime_state(connection, "watcher_error", "")
     connection.close()
@@ -116,6 +198,9 @@ def start_watcher(config: Settings) -> tuple[bool, int | None]:
 
 def stop_watcher(config: Settings) -> bool:
     snapshot = watcher_snapshot(config)
+    connection = db(config.db_path)
+    set_runtime_state(connection, "watcher_desired", "paused")
+    connection.close()
     if not snapshot["alive"] or not snapshot["pid"]:
         return False
     os.kill(snapshot["pid"], signal.SIGTERM)
@@ -131,7 +216,9 @@ def start_content_indexer(
     snapshot = indexer_snapshot(config)
     if snapshot["alive"]:
         return False, snapshot["pid"]
+    ensure_local_ollama(config)
     connection = db(config.db_path)
+    set_runtime_state(connection, "indexer_desired", "online")
     set_runtime_state(connection, "indexer_status", "starting")
     set_runtime_state(connection, "indexer_error", "")
     connection.close()
@@ -144,6 +231,9 @@ def start_content_indexer(
 
 def stop_content_indexer(config: Settings) -> bool:
     snapshot = indexer_snapshot(config)
+    connection = db(config.db_path)
+    set_runtime_state(connection, "indexer_desired", "paused")
+    connection.close()
     if not snapshot["alive"] or not snapshot["pid"]:
         return False
     os.kill(snapshot["pid"], signal.SIGTERM)

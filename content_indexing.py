@@ -4,6 +4,7 @@ import html
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -21,6 +22,7 @@ from tgbrain import (
     METADATA_VERSION,
     Settings,
     build_indexed_text,
+    describe,
     embed,
     message_metadata,
 )
@@ -97,6 +99,7 @@ class MetadataParser(HTMLParser):
 @dataclass
 class EnrichmentResult:
     row_id: int
+    vision_text: str
     extracted_text: str
     link_metadata_json: str
     content_status: str
@@ -111,6 +114,11 @@ class EnrichmentResult:
 def _clean_text(value: str) -> str:
     value = value.replace("\x00", " ").strip()
     return value[:MAX_EXTRACTED_CHARS]
+
+
+def _valid_vision_description(value: str) -> bool:
+    words = re.findall(r"[A-Za-z][A-Za-z0-9'-]+", value)
+    return len(value.strip()) >= 30 and len(words) >= 5
 
 
 def ensure_vision_binary() -> Path:
@@ -475,6 +483,7 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
     successes = 0
     expected = 0
     extracted_text = ""
+    vision_text = row.get("vision_text") or ""
     media_path = row.get("media_path")
     if media_path:
         expected += 1
@@ -483,6 +492,18 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
             successes += 1
         except Exception as error:
             errors.append(f"Media: {error}")
+        if row.get("media_type") == "image" and config.enable_vision:
+            expected += 1
+            try:
+                candidate_vision_text = describe(config, media_path)
+                if not _valid_vision_description(candidate_vision_text):
+                    raise ContentUnavailable(
+                        "The vision model returned no useful description"
+                    )
+                vision_text = candidate_vision_text
+                successes += 1
+            except Exception as error:
+                errors.append(f"Image understanding: {error}")
 
     try:
         urls = json.loads(row.get("urls_json") or "[]")
@@ -525,6 +546,7 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
 
     updated = {
         **row,
+        "vision_text": vision_text,
         "extracted_text": extracted_text,
         "link_metadata_json": json.dumps(link_metadata),
     }
@@ -543,6 +565,7 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
 
     return EnrichmentResult(
         row_id=int(row["id"]),
+        vision_text=vision_text,
         extracted_text=extracted_text,
         link_metadata_json=json.dumps(link_metadata),
         content_status=status,
@@ -559,7 +582,7 @@ def apply_enrichment(connection, result: EnrichmentResult) -> None:
     connection.execute(
         """
         UPDATE messages
-        SET extracted_text = ?, link_metadata_json = ?,
+        SET vision_text = ?, extracted_text = ?, link_metadata_json = ?,
             content_status = ?, content_error = ?,
             enrichment_version = ?, enriched_at = ?,
             indexed_text = ?, embedding_json = ?,
@@ -568,6 +591,7 @@ def apply_enrichment(connection, result: EnrichmentResult) -> None:
         WHERE id = ?
         """,
         (
+            result.vision_text,
             result.extracted_text,
             result.link_metadata_json,
             result.content_status,
@@ -586,16 +610,32 @@ def apply_enrichment(connection, result: EnrichmentResult) -> None:
     connection.commit()
 
 
-def pending_count(connection) -> int:
+def pending_count(
+    connection,
+    *,
+    require_vision: bool = False,
+) -> int:
+    missing_vision = (
+        """
+        OR (
+            media_type = 'image'
+            AND media_path IS NOT NULL
+            AND TRIM(vision_text) = ''
+        )
+        """
+        if require_vision
+        else ""
+    )
     return int(
         connection.execute(
-            """
+            f"""
             SELECT COUNT(*)
             FROM messages
             WHERE duplicate_of_id IS NULL
               AND (
                   enrichment_version < ?
                   OR content_status IN ('pending', 'processing')
+                  {missing_vision}
               )
             """,
             (ENRICHMENT_VERSION,),
@@ -603,20 +643,41 @@ def pending_count(connection) -> int:
     )
 
 
-def next_pending(connection, limit: int = 12) -> list[dict]:
-    rows = connection.execute(
+def next_pending(
+    connection,
+    limit: int = 12,
+    *,
+    require_vision: bool = False,
+) -> list[dict]:
+    missing_vision = (
         """
+        OR (
+            media_type = 'image'
+            AND media_path IS NOT NULL
+            AND TRIM(vision_text) = ''
+            AND (
+                enriched_at IS NULL
+                OR datetime(enriched_at) <= datetime('now', '-15 minutes')
+            )
+        )
+        """
+        if require_vision
+        else ""
+    )
+    rows = connection.execute(
+        f"""
         SELECT *
         FROM messages
         WHERE duplicate_of_id IS NULL
           AND (
               enrichment_version < ?
               OR content_status IN ('pending', 'processing')
+              {missing_vision}
           )
         ORDER BY
             CASE
-                WHEN media_type IN ('pdf', 'document', 'audio') THEN 0
-                WHEN media_type = 'image' THEN 1
+                WHEN media_type = 'image' THEN 0
+                WHEN media_type IN ('pdf', 'document', 'audio') THEN 1
                 WHEN urls_json != '[]' THEN 2
                 ELSE 3
             END,

@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import json
 import math
-import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +12,7 @@ import streamlit as st
 
 from service_control import (
     indexer_snapshot,
+    reconcile_services,
     start_content_indexer,
     start_incremental_sync,
     start_watcher,
@@ -382,17 +382,15 @@ if "page" not in st.session_state:
 if "scope_filter" not in st.session_state:
     st.session_state.scope_filter = "All"
 
-if "service_bootstrapped" not in st.session_state:
-    if os.getenv("AUTO_START_WATCHER", "true").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        start_watcher(config)
-    if config.enable_content_indexing:
-        start_content_indexer(config)
-    st.session_state.service_bootstrapped = True
+reconcile_services(config)
+
+
+@st.fragment(run_every=20)
+def keep_background_services_online() -> None:
+    reconcile_services(config)
+
+
+keep_background_services_online()
 
 stats = connection.execute(
     """
@@ -418,6 +416,14 @@ stats = connection.execute(
             THEN 1 ELSE 0
         END)
             AS indexed,
+        SUM(CASE
+            WHEN media_type = 'image'
+             AND media_path IS NOT NULL
+             AND TRIM(vision_text) = ''
+             AND duplicate_of_id IS NULL
+            THEN 1 ELSE 0
+        END)
+            AS visual_pending,
         SUM(CASE WHEN duplicate_of_id IS NOT NULL THEN 1 ELSE 0 END)
             AS duplicates,
         MAX(date_utc) AS latest
@@ -952,11 +958,19 @@ result_label = "result" if len(rows) == 1 else "results"
 st.caption(f"{len(rows):,} {result_label}")
 
 if not rows:
-    st.info(
-        "Nothing matches these filters yet. Try a broader search or another "
-        "topic.",
-        icon=":material/search:",
-    )
+    if q and config.enable_vision and int(stats["visual_pending"] or 0):
+        st.warning(
+            "No indexed match yet. The background image reader is still "
+            f"analyzing {int(stats['visual_pending']):,} older images; "
+            "new images are handled first.",
+            icon=":material/image_search:",
+        )
+    else:
+        st.info(
+            "Nothing matches these filters yet. Try a broader search or "
+            "another topic.",
+            icon=":material/search:",
+        )
     connection.close()
     st.stop()
 

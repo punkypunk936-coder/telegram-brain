@@ -2,9 +2,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
+from content_indexing import apply_enrichment, enrich_record
 from media_dedupe import (
     backfill_media_duplicates,
     find_duplicate,
@@ -321,6 +323,106 @@ class TelegramBrainTests(unittest.TestCase):
             results[0]["_match_reasons"],
         )
 
+    def test_image_description_is_indexed_and_searchable(self):
+        root = Path(self.temp_dir.name)
+        image_path = root / "jensen-meme.png"
+        self._meme_canvas().save(image_path)
+        self.insert(
+            55,
+            "",
+            media_type="image",
+            media_path=image_path,
+            file_name=image_path.name,
+        )
+        row = dict(
+            self.connection.execute(
+                "SELECT * FROM messages WHERE message_id = 55"
+            ).fetchone()
+        )
+        vision_config = Settings(
+            **{
+                **self.config.__dict__,
+                "enable_vision": True,
+            }
+        )
+        with (
+            patch(
+                "content_indexing.extract_with_vision",
+                return_value="",
+            ),
+            patch(
+                "content_indexing.describe",
+                return_value=(
+                    "Meme featuring NVIDIA CEO Jensen Huang in his leather "
+                    "jacket, joking about GPU demand."
+                ),
+            ),
+        ):
+            apply_enrichment(
+                self.connection,
+                enrich_record(vision_config, row),
+            )
+
+        results = search(
+            self.connection,
+            self.config,
+            "Jensen Huang",
+            limit=20,
+        )
+
+        self.assertEqual([item["message_id"] for item in results], [55])
+        self.assertIn(
+            "Matched an AI image description",
+            results[0]["_match_reasons"],
+        )
+
+    def test_unhelpful_image_description_is_not_indexed(self):
+        root = Path(self.temp_dir.name)
+        image_path = root / "unhelpful.png"
+        self._meme_canvas().save(image_path)
+        self.insert(
+            56,
+            "",
+            media_type="image",
+            media_path=image_path,
+            file_name=image_path.name,
+        )
+        row = dict(
+            self.connection.execute(
+                "SELECT * FROM messages WHERE message_id = 56"
+            ).fetchone()
+        )
+        vision_config = Settings(
+            **{
+                **self.config.__dict__,
+                "enable_vision": True,
+            }
+        )
+        with (
+            patch(
+                "content_indexing.extract_with_vision",
+                return_value="",
+            ),
+            patch(
+                "content_indexing.describe",
+                return_value="[0.1, 0.2]",
+            ),
+        ):
+            result = enrich_record(vision_config, row)
+
+        self.assertEqual(result.vision_text, "")
+        self.assertEqual(result.content_status, "partial")
+        self.assertIn(
+            "no useful description",
+            result.content_error,
+        )
+
+    def test_file_database_uses_wal_for_concurrent_services(self):
+        mode = self.connection.execute(
+            "PRAGMA journal_mode"
+        ).fetchone()[0]
+        self.assertEqual(mode.lower(), "wal")
+
     def test_multi_term_search_prefers_complete_match(self):
         self.insert(60, "Social status can be measured in followers")
         self.insert(61, "A separate note about social media")
@@ -334,6 +436,18 @@ class TelegramBrainTests(unittest.TestCase):
         )
 
         self.assertEqual([row["message_id"] for row in results], [60])
+
+    def test_multi_term_fallback_does_not_return_single_term_noise(self):
+        self.insert(63, "A generic meme with no named person")
+
+        results = search(
+            self.connection,
+            self.config,
+            "Jensen Huang meme",
+            limit=20,
+        )
+
+        self.assertEqual(results, [])
 
     def _meme_canvas(self, variant: bool = False) -> Image.Image:
         image = Image.new("RGB", (720, 480), "#f2f2ed")

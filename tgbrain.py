@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
 import mimetypes
@@ -15,6 +16,7 @@ from typing import Iterable
 
 import requests
 from dotenv import load_dotenv
+from PIL import Image, ImageOps
 from telethon import TelegramClient
 
 from media_dedupe import (
@@ -27,7 +29,7 @@ load_dotenv()
 
 URL_RE = re.compile(r"https?://[^\s<>\]\)]+", re.IGNORECASE)
 METADATA_VERSION = 8
-ENRICHMENT_VERSION = 1
+ENRICHMENT_VERSION = 4
 CAPTURE_VERSION = 1
 _INITIALIZED_DATABASES: set[str] = set()
 
@@ -545,10 +547,23 @@ def db(path: Path | str) -> sqlite3.Connection:
     connection = sqlite3.connect(resolved, timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout=30000")
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA foreign_keys=ON")
     if resolved not in _INITIALIZED_DATABASES:
         connection.executescript(SCHEMA)
         _migrate(connection)
-        rebuild_captures(connection)
+        needs_capture_refresh = connection.execute(
+            """
+            SELECT 1
+            FROM messages
+            WHERE capture_version < ?
+            LIMIT 1
+            """,
+            (CAPTURE_VERSION,),
+        ).fetchone()
+        if needs_capture_refresh:
+            rebuild_captures(connection)
         _INITIALIZED_DATABASES.add(resolved)
     return connection
 
@@ -574,28 +589,56 @@ def embed(config: Settings, text: str) -> list[float]:
     return data["embeddings"][0]
 
 
+def image_for_vision(path: str, max_edge: int = 896) -> str:
+    with Image.open(path) as source:
+        source.seek(0)
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=84,
+            optimize=True,
+        )
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
 def describe(config: Settings, path: str) -> str:
-    image = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    image = image_for_vision(path)
     data = ollama_post(
         f"{config.ollama_url}/api/chat",
         {
             "model": config.vision_model,
             "stream": False,
+            "keep_alive": "10m",
+            "options": {
+                "temperature": 0.1,
+                "num_predict": 96,
+            },
             "messages": [
                 {
                     "role": "user",
                     "content": (
-                        "Describe this saved image for future search. "
-                        "Transcribe visible text accurately, identify meme "
-                        "context, objects, brands, tickers, charts and the "
-                        "central idea. Be concise and information-dense."
+                        "Describe this image in detail for search. Include any "
+                        "visible words, the meme joke, objects, and "
+                        "recognizable public people."
                     ),
                     "images": [image],
                 }
             ],
         },
+        timeout=60,
     )
-    return data.get("message", {}).get("content", "").strip()
+    message = data.get("message", {})
+    content = message.get("content", "").strip()
+    if content:
+        return content
+    return re.sub(
+        r"</?think>",
+        "",
+        message.get("thinking", ""),
+    ).strip()
 
 
 def media_kind(path: str | None, mime: str | None) -> str | None:
@@ -1710,10 +1753,20 @@ def search(
     if not found:
         terms = _query_terms(query)[:8]
         if terms:
-            like_clause = " OR ".join(
-                "LOWER(m.indexed_text) LIKE ?" for _ in terms
-            )
-            fallback_clauses = [f"({like_clause})", *clauses]
+            if len(terms) == 1:
+                term_clause = "LOWER(m.indexed_text) LIKE ?"
+                term_params: list[Any] = [f"%{terms[0]}%"]
+            else:
+                coverage_clause = " + ".join(
+                    "CASE WHEN LOWER(m.indexed_text) LIKE ? THEN 1 ELSE 0 END"
+                    for _ in terms
+                )
+                term_clause = f"({coverage_clause}) >= ?"
+                term_params = [
+                    *(f"%{term}%" for term in terms),
+                    min(2, len(terms)),
+                ]
+            fallback_clauses = [f"({term_clause})", *clauses]
             fallback_where = "WHERE " + " AND ".join(fallback_clauses)
             rows = connection.execute(
                 f"""
@@ -1722,7 +1775,7 @@ def search(
                 LIMIT ?
                 """,
                 [
-                    *(f"%{term}%" for term in terms),
+                    *term_params,
                     *filter_params,
                     limit * 2,
                 ],

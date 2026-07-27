@@ -113,7 +113,7 @@ Install Ollama, then:
 
 ```bash
 ollama pull embeddinggemma
-ollama pull gemma3:4b
+ollama pull moondream:1.8b
 ```
 
 Enable the models in `.env`:
