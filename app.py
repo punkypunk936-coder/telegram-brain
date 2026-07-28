@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 import streamlit as st
 
+from clipboard_utils import ClipboardError, copy_media, copy_text
 from service_control import (
     indexer_snapshot,
     reconcile_services,
@@ -343,6 +344,23 @@ def process_scope(rows: list[dict], scope: str) -> list[dict]:
     if scope == "Media":
         return [row for row in rows if row.get("media_path")]
     return rows
+
+
+def media_copy_label(items: list[dict]) -> str:
+    if len(items) != 1:
+        return f"Copy {len(items)} media"
+    item = items[0]
+    media_type = item.get("media_type")
+    suffix = item["_path"].suffix.lower()
+    if suffix == ".gif":
+        return "Copy GIF"
+    if media_type == "image":
+        return "Copy image"
+    if media_type == "video":
+        return "Copy video"
+    if media_type == "audio":
+        return "Copy audio"
+    return "Copy file"
 
 
 def index_label(row: dict) -> tuple[str, str]:
@@ -1144,11 +1162,63 @@ for row in page_rows:
             else:
                 st.audio(str(item["_path"]))
 
-        if urls or media_exists or note:
+        copyable_text = text or extracted_text
+        if not copyable_text and urls:
+            copyable_text = "\n".join(urls)
+
+        utility_count = (
+            int(bool(copyable_text))
+            + int(media_exists)
+            + len(urls[:2])
+        )
+        if utility_count:
             utility_columns = st.columns(
-                max(1, min(3, len(urls[:2]) + int(media_exists) + int(bool(note))))
+                min(4, utility_count)
             )
             utility_index = 0
+            if copyable_text:
+                with utility_columns[utility_index]:
+                    if st.button(
+                        "Copy text",
+                        icon=":material/content_copy:",
+                        key=f"copy-text-{row['id']}",
+                        width="stretch",
+                    ):
+                        try:
+                            copy_text(copyable_text)
+                            st.toast(
+                                "Text copied.",
+                                icon=":material/check_circle:",
+                            )
+                        except ClipboardError as error:
+                            st.toast(
+                                str(error),
+                                icon=":material/error:",
+                            )
+                utility_index += 1
+            if media_exists:
+                with utility_columns[utility_index]:
+                    if st.button(
+                        media_copy_label(existing_media),
+                        icon=":material/content_copy:",
+                        key=f"copy-media-{row['id']}",
+                        width="stretch",
+                    ):
+                        try:
+                            copied = copy_media(
+                                item["_path"] for item in existing_media
+                            )
+                            noun = "asset" if copied == 1 else "assets"
+                            st.toast(
+                                f"{copied} media {noun} copied.",
+                                icon=":material/check_circle:",
+                            )
+                        except ClipboardError as error:
+                            st.toast(
+                                str(error),
+                                icon=":material/error:",
+                            )
+                utility_index += 1
             for url in urls[:2]:
                 host = urlparse(url).netloc.replace("www.", "") or "link"
                 with utility_columns[utility_index]:
@@ -1159,25 +1229,8 @@ for row in page_rows:
                         width="stretch",
                     )
                 utility_index += 1
-            if media_exists:
-                with utility_columns[utility_index]:
-                    try:
-                        st.download_button(
-                            "Local copy",
-                            data=media.read_bytes(),
-                            file_name=media.name,
-                            mime=existing_media[0].get("mime_type")
-                            or "application/octet-stream",
-                            icon=":material/download:",
-                            key=f"download-{row['id']}",
-                            width="stretch",
-                        )
-                    except OSError:
-                        st.caption("Local file unavailable.")
-                utility_index += 1
-            if note and utility_index < len(utility_columns):
-                with utility_columns[utility_index]:
-                    st.caption(f"Note: {clean_preview(note, 120)}")
+        if note:
+            st.caption(f"Note: {clean_preview(note, 120)}")
 
         with st.expander("Why this result"):
             for reason in row.get("_match_reasons") or [
