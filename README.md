@@ -20,8 +20,9 @@ Telegram's service chat when you use it as a personal inbox.
   filenames with SQLite FTS5.
 - Explains why each result matched and whether every part has been indexed.
 - Organises results by topic, type and date.
-- Copies full text, paste-ready images, original GIFs/videos/documents and
-  multi-asset albums directly to the macOS clipboard.
+- Copies full text, individual or grouped web links, paste-ready images,
+  original GIFs/videos/documents and multi-asset albums directly to the
+  macOS clipboard.
 - Carries topic context across adjacent parts of the same long capture.
 - Lets you star useful items, add private notes and correct a topic.
 - Detects credentials and sensitive documents, then hides them from normal results.

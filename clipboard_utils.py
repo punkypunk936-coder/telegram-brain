@@ -4,6 +4,7 @@ import platform
 import subprocess
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parent
@@ -90,6 +91,26 @@ def copy_text(value: str) -> None:
     if not value.strip():
         raise ClipboardError("There is no text to copy.")
     _run_clipboard("text", text=value)
+
+
+def copy_links(values: Iterable[str]) -> int:
+    links: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        link = str(value or "").strip()
+        if not link or link in seen:
+            continue
+        parsed = urlparse(link)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ClipboardError(f"{link or 'Link'} is not a valid web link.")
+        links.append(link)
+        seen.add(link)
+
+    if not links:
+        raise ClipboardError("There is no link to copy.")
+
+    _run_clipboard("text", text="\n".join(links))
+    return len(links)
 
 
 def copy_media(paths: Iterable[str | Path]) -> int:

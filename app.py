@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import streamlit as st
 
-from clipboard_utils import ClipboardError, copy_media, copy_text
+from clipboard_utils import ClipboardError, copy_links, copy_media, copy_text
 from service_control import (
     indexer_snapshot,
     reconcile_services,
@@ -161,6 +161,43 @@ st.markdown(
             overflow-wrap: anywhere;
         }
 
+        .action-label {
+            font-size: 0.72rem;
+            font-weight: 680;
+            margin: 0.85rem 0 0.4rem;
+            opacity: 0.62;
+            text-transform: uppercase;
+        }
+
+        .link-title {
+            font-size: 0.9rem;
+            font-weight: 650;
+            line-height: 1.35;
+            margin-top: 0.1rem;
+            overflow-wrap: anywhere;
+        }
+
+        .link-url {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.72rem;
+            line-height: 1.35;
+            margin-top: 0.18rem;
+            opacity: 0.62;
+            overflow-wrap: anywhere;
+        }
+
+        .link-description {
+            font-size: 0.8rem;
+            line-height: 1.4;
+            margin-top: 0.2rem;
+            opacity: 0.72;
+        }
+
+        .result-divider {
+            border-top: 1px solid var(--brain-line);
+            margin: 0.8rem 0 0.2rem;
+        }
+
         div[data-testid="stVerticalBlockBorderWrapper"] {
             border-radius: 6px;
             border-color: var(--brain-line);
@@ -191,6 +228,10 @@ st.markdown(
                 grid-template-columns: repeat(2, minmax(0, 1fr));
                 gap: 0.65rem 1rem;
                 margin-bottom: 0.75rem;
+            }
+
+            .link-url {
+                font-size: 0.68rem;
             }
         }
     </style>
@@ -361,6 +402,185 @@ def media_copy_label(items: list[dict]) -> str:
     if media_type == "audio":
         return "Copy audio"
     return "Copy file"
+
+
+def existing_media_items(row: dict) -> list[dict]:
+    items = row.get("media_items") or []
+    if not items and row.get("media_path"):
+        items = [
+            {
+                "id": row["id"],
+                "path": row["media_path"],
+                "media_type": row.get("media_type"),
+                "file_name": row.get("file_name"),
+                "mime_type": row.get("mime_type"),
+            }
+        ]
+    return [
+        {**item, "_path": Path(item["path"])}
+        for item in items
+        if item.get("path") and Path(item["path"]).exists()
+    ]
+
+
+def result_copy_text(row: dict) -> tuple[str, str]:
+    original = mask_sensitive_text(row.get("text") or "").strip()
+    if original:
+        return original, "Copy text"
+    extracted = mask_sensitive_text(
+        row.get("extracted_text") or ""
+    ).strip()
+    if extracted:
+        return extracted, "Copy indexed text"
+    return "", ""
+
+
+def link_details(row: dict) -> list[dict]:
+    urls = parse_urls(row)
+    metadata = parse_link_metadata(row)
+    details = []
+    for index, url in enumerate(urls):
+        match = next(
+            (
+                item
+                for item in metadata
+                if item.get("url") == url
+            ),
+            metadata[index] if index < len(metadata) else {},
+        )
+        host = urlparse(url).netloc.replace("www.", "") or "Saved link"
+        details.append(
+            {
+                "url": url,
+                "host": host,
+                "title": (
+                    str(match.get("title") or "").strip()
+                    or f"Link from {host}"
+                ),
+                "description": str(
+                    match.get("description") or ""
+                ).strip(),
+            }
+        )
+    return details
+
+
+def clipboard_error(error: ClipboardError) -> None:
+    st.toast(str(error), icon=":material/error:")
+
+
+def render_copy_actions(row: dict, key_prefix: str) -> None:
+    copyable_text, text_label = result_copy_text(row)
+    media_items = existing_media_items(row)
+    urls = parse_urls(row)
+    actions = []
+    if copyable_text:
+        actions.append(("text", text_label))
+    if media_items:
+        actions.append(("media", media_copy_label(media_items)))
+    if len(urls) > 1:
+        actions.append(("links", f"Copy all {len(urls)} links"))
+    if not actions:
+        return
+
+    st.markdown(
+        '<div class="action-label">Use this item</div>',
+        unsafe_allow_html=True,
+    )
+    columns = st.columns(len(actions))
+    for column, (action, label) in zip(columns, actions):
+        with column:
+            if not st.button(
+                label,
+                icon=":material/content_copy:",
+                key=f"{key_prefix}-{action}",
+                width="stretch",
+            ):
+                continue
+            try:
+                if action == "text":
+                    copy_text(copyable_text)
+                    st.toast(
+                        "Text copied exactly as saved.",
+                        icon=":material/check_circle:",
+                    )
+                elif action == "media":
+                    copied = copy_media(
+                        item["_path"] for item in media_items
+                    )
+                    noun = "asset" if copied == 1 else "assets"
+                    st.toast(
+                        f"{copied} media {noun} copied.",
+                        icon=":material/check_circle:",
+                    )
+                else:
+                    copied = copy_links(urls)
+                    st.toast(
+                        f"{copied} links copied in their original order.",
+                        icon=":material/check_circle:",
+                    )
+            except ClipboardError as error:
+                clipboard_error(error)
+
+
+def render_link_actions(row: dict, key_prefix: str) -> None:
+    details = link_details(row)
+    if not details:
+        return
+    st.markdown(
+        '<div class="action-label">Links</div>',
+        unsafe_allow_html=True,
+    )
+    for index, item in enumerate(details[:5]):
+        if index:
+            st.markdown(
+                '<div class="result-divider"></div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown(
+            '<div class="link-title">'
+            + html.escape(item["title"])
+            + "</div>"
+            + '<div class="link-url">'
+            + html.escape(item["url"])
+            + "</div>"
+            + (
+                '<div class="link-description">'
+                + html.escape(clean_preview(item["description"], 180))
+                + "</div>"
+                if item["description"]
+                else ""
+            ),
+            unsafe_allow_html=True,
+        )
+        copy_column, open_column = st.columns(2)
+        with copy_column:
+            if st.button(
+                "Copy link",
+                icon=":material/link:",
+                key=f"{key_prefix}-copy-link-{index}",
+                width="stretch",
+            ):
+                try:
+                    copy_links([item["url"]])
+                    st.toast(
+                        "Link copied.",
+                        icon=":material/check_circle:",
+                    )
+                except ClipboardError as error:
+                    clipboard_error(error)
+        with open_column:
+            st.link_button(
+                "Open link",
+                item["url"],
+                icon=":material/open_in_new:",
+                width="stretch",
+            )
+    if len(details) > 5:
+        st.caption(
+            f"{len(details) - 5} additional links are included in "
+            '"Copy all links."'
+        )
 
 
 def index_label(row: dict) -> tuple[str, str]:
@@ -873,6 +1093,14 @@ if home_mode:
                     args=(latest_category,),
                     width="stretch",
                 )
+            render_copy_actions(
+                latest_row,
+                f"latest-{latest_row['id']}",
+            )
+            render_link_actions(
+                latest_row,
+                f"latest-{latest_row['id']}",
+            )
 
     st.markdown(
         '<div class="section-title">Buckets</div>',
@@ -1025,22 +1253,7 @@ if total_pages > 1:
             st.rerun()
 
 for row in page_rows:
-    media_items = row.get("media_items") or []
-    if not media_items and row.get("media_path"):
-        media_items = [
-            {
-                "id": row["id"],
-                "path": row["media_path"],
-                "media_type": row.get("media_type"),
-                "file_name": row.get("file_name"),
-                "mime_type": row.get("mime_type"),
-            }
-        ]
-    existing_media = [
-        {**item, "_path": Path(item["path"])}
-        for item in media_items
-        if item.get("path") and Path(item["path"]).exists()
-    ]
+    existing_media = existing_media_items(row)
     media_exists = bool(existing_media)
     media = existing_media[0]["_path"] if existing_media else None
     text = mask_sensitive_text(row.get("text") or "").strip()
@@ -1048,7 +1261,6 @@ for row in page_rows:
         row.get("extracted_text") or ""
     ).strip()
     title = result_title({**row, "text": text})
-    urls = parse_urls(row)
     category = row.get("display_category") or row.get("category")
     note = row.get("note") or ""
 
@@ -1162,73 +1374,8 @@ for row in page_rows:
             else:
                 st.audio(str(item["_path"]))
 
-        copyable_text = text or extracted_text
-        if not copyable_text and urls:
-            copyable_text = "\n".join(urls)
-
-        utility_count = (
-            int(bool(copyable_text))
-            + int(media_exists)
-            + len(urls[:2])
-        )
-        if utility_count:
-            utility_columns = st.columns(
-                min(4, utility_count)
-            )
-            utility_index = 0
-            if copyable_text:
-                with utility_columns[utility_index]:
-                    if st.button(
-                        "Copy text",
-                        icon=":material/content_copy:",
-                        key=f"copy-text-{row['id']}",
-                        width="stretch",
-                    ):
-                        try:
-                            copy_text(copyable_text)
-                            st.toast(
-                                "Text copied.",
-                                icon=":material/check_circle:",
-                            )
-                        except ClipboardError as error:
-                            st.toast(
-                                str(error),
-                                icon=":material/error:",
-                            )
-                utility_index += 1
-            if media_exists:
-                with utility_columns[utility_index]:
-                    if st.button(
-                        media_copy_label(existing_media),
-                        icon=":material/content_copy:",
-                        key=f"copy-media-{row['id']}",
-                        width="stretch",
-                    ):
-                        try:
-                            copied = copy_media(
-                                item["_path"] for item in existing_media
-                            )
-                            noun = "asset" if copied == 1 else "assets"
-                            st.toast(
-                                f"{copied} media {noun} copied.",
-                                icon=":material/check_circle:",
-                            )
-                        except ClipboardError as error:
-                            st.toast(
-                                str(error),
-                                icon=":material/error:",
-                            )
-                utility_index += 1
-            for url in urls[:2]:
-                host = urlparse(url).netloc.replace("www.", "") or "link"
-                with utility_columns[utility_index]:
-                    st.link_button(
-                        host,
-                        url,
-                        icon=":material/open_in_new:",
-                        width="stretch",
-                    )
-                utility_index += 1
+        render_copy_actions(row, f"result-{row['id']}")
+        render_link_actions(row, f"result-{row['id']}")
         if note:
             st.caption(f"Note: {clean_preview(note, 120)}")
 

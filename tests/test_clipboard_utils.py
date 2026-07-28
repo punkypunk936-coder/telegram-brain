@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from clipboard_utils import ClipboardError, copy_media, copy_text
+from clipboard_utils import ClipboardError, copy_links, copy_media, copy_text
 
 
 class ClipboardUtilsTests(unittest.TestCase):
@@ -29,6 +29,27 @@ class ClipboardUtilsTests(unittest.TestCase):
     def test_blank_text_is_rejected(self):
         with self.assertRaisesRegex(ClipboardError, "no text"):
             copy_text(" \n ")
+
+    def test_single_link_is_copied_exactly(self):
+        value = "https://example.com/article?ref=telegram"
+        with patch("clipboard_utils._run_clipboard") as run:
+            copied = copy_links([value])
+
+        self.assertEqual(copied, 1)
+        run.assert_called_once_with("text", text=value)
+
+    def test_multiple_links_keep_order_and_remove_exact_duplicates(self):
+        first = "https://example.com/one"
+        second = "https://example.com/two"
+        with patch("clipboard_utils._run_clipboard") as run:
+            copied = copy_links([first, second, first])
+
+        self.assertEqual(copied, 2)
+        run.assert_called_once_with("text", text=f"{first}\n{second}")
+
+    def test_invalid_link_is_rejected(self):
+        with self.assertRaisesRegex(ClipboardError, "valid web link"):
+            copy_links(["not-a-link"])
 
     def test_static_image_is_copied_as_paste_ready_image(self):
         image = self.file("meme.png")
