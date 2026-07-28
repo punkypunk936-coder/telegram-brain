@@ -48,8 +48,8 @@ st.markdown(
         }
 
         .block-container {
-            max-width: 1280px;
-            padding-top: 4rem;
+            max-width: 1180px;
+            padding-top: 3.4rem;
             padding-bottom: 5rem;
         }
 
@@ -67,7 +67,7 @@ st.markdown(
 
         .app-title {
             color: inherit;
-            font-size: 1.8rem;
+            font-size: 1.72rem;
             font-weight: 720;
             line-height: 1.15;
             margin: 0;
@@ -76,8 +76,23 @@ st.markdown(
         .app-subtitle {
             color: inherit;
             font-size: 0.94rem;
-            margin: 0.25rem 0 1.25rem;
+            margin: 0.25rem 0 0.8rem;
             opacity: 0.68;
+        }
+
+        .search-label {
+            font-size: 0.78rem;
+            font-weight: 680;
+            margin: 0.35rem 0 0.35rem;
+            opacity: 0.72;
+        }
+
+        .library-context {
+            color: inherit;
+            font-size: 0.78rem;
+            line-height: 1.4;
+            margin: 0.55rem 0 1.15rem;
+            opacity: 0.62;
         }
 
         .result-title {
@@ -97,6 +112,13 @@ st.markdown(
             opacity: 0.68;
         }
 
+        .result-count {
+            color: inherit;
+            font-size: 0.82rem;
+            margin: -0.35rem 0 0.8rem;
+            opacity: 0.64;
+        }
+
         .sync-online {
             color: var(--brain-teal);
             font-size: 0.84rem;
@@ -109,34 +131,48 @@ st.markdown(
             font-weight: 650;
         }
 
-        .metric-grid {
-            display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
-            gap: 1rem;
-            margin: 0.95rem 0 1.1rem;
+        .status-strip {
+            align-items: center;
+            border-bottom: 1px solid var(--brain-line);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.55rem 1.1rem;
+            margin: 0.15rem 0 1rem;
+            padding: 0 0 0.75rem;
         }
 
-        .metric-item {
-            border-top: 1px solid var(--brain-line);
-            min-width: 0;
-            padding-top: 0.65rem;
-        }
-
-        .metric-label {
-            font-size: 0.78rem;
+        .status-item {
+            align-items: center;
+            display: inline-flex;
+            font-size: 0.75rem;
+            gap: 0.38rem;
             opacity: 0.72;
         }
 
-        .metric-value {
-            font-size: 1.35rem;
-            font-weight: 620;
-            margin-top: 0.18rem;
+        .status-dot {
+            background: var(--brain-amber);
+            border-radius: 50%;
+            display: inline-block;
+            height: 0.45rem;
+            width: 0.45rem;
+        }
+
+        .status-dot.online {
+            background: var(--brain-teal);
         }
 
         .section-title {
-            font-size: 1rem;
+            font-size: 1.02rem;
             font-weight: 680;
-            margin: 1.2rem 0 0.7rem;
+            margin: 1.45rem 0 0.18rem;
+            overflow-wrap: anywhere;
+        }
+
+        .section-subtitle {
+            font-size: 0.82rem;
+            line-height: 1.45;
+            margin: 0 0 0.75rem;
+            opacity: 0.64;
         }
 
         .latest-preview {
@@ -147,7 +183,7 @@ st.markdown(
         }
 
         .bucket-count {
-            font-size: 1.45rem;
+            font-size: 1.32rem;
             font-weight: 650;
             line-height: 1.15;
             margin: 0.35rem 0 0.2rem;
@@ -213,6 +249,16 @@ st.markdown(
             border-radius: 6px;
         }
 
+        [data-testid="stTextInputRootElement"] input {
+            font-size: 1rem;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stExpander"] {
+            border-left: 0;
+            border-right: 0;
+            border-radius: 0;
+        }
+
         @media (max-width: 720px) {
             .block-container {
                 padding-top: 3.75rem;
@@ -224,10 +270,8 @@ st.markdown(
                 font-size: 1.45rem;
             }
 
-            .metric-grid {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 0.65rem 1rem;
-                margin-bottom: 0.75rem;
+            .status-strip {
+                gap: 0.45rem 0.85rem;
             }
 
             .link-url {
@@ -781,11 +825,50 @@ latest_results = search(
 )
 latest_row = latest_results[0] if latest_results else None
 
-with st.sidebar:
-    st.markdown("### Library")
+sync_snapshot = watcher_snapshot(config)
+index_snapshot = indexer_snapshot(config)
+indexed_total = int(stats["indexed"] or 0)
+message_total = int(stats["messages"] or 0)
+sync_online = (
+    sync_snapshot["alive"] and sync_snapshot["status"] == "online"
+)
+index_online = bool(index_snapshot["alive"])
 
-    def sync_status_panel() -> None:
-        snapshot = watcher_snapshot(config)
+with st.sidebar:
+    st.markdown("### Refine")
+
+    content_label = st.selectbox(
+        "Content type",
+        list(CONTENT_TYPES),
+        key="content_filter",
+        on_change=reset_page,
+    )
+    selected_topic = st.selectbox(
+        "Topic",
+        available_topics,
+        key="topic_filter",
+        on_change=reset_page,
+    )
+    date_window = st.selectbox(
+        "Date",
+        list(DATE_WINDOWS),
+        key="date_filter",
+        on_change=reset_page,
+    )
+    sort_order = st.selectbox(
+        "Sort",
+        ["Most relevant", "Newest first", "Oldest first"],
+        key="sort_filter",
+        on_change=reset_page,
+    )
+    page_size = st.select_slider(
+        "Results per page",
+        options=[10, 20, 30, 50],
+        value=20,
+        on_change=reset_page,
+    )
+
+    def sync_status_panel(snapshot: dict) -> None:
         if snapshot["alive"] and snapshot["status"] == "online":
             st.markdown(
                 '<div class="sync-online">Live sync online</div>',
@@ -840,123 +923,126 @@ with st.sidebar:
                 start_incremental_sync(config)
                 st.toast("Background catch-up started.")
 
-    sync_status_panel()
+    services_need_attention = not sync_online or not index_online
+    with st.expander(
+        "Background services",
+        expanded=services_need_attention,
+        icon=":material/sync:",
+    ):
+        sync_status_panel(sync_snapshot)
+        st.divider()
 
-    st.divider()
+        if index_snapshot["alive"]:
+            st.markdown(
+                '<div class="sync-online">Content indexer online</div>',
+                unsafe_allow_html=True,
+            )
+            st.progress(
+                indexed_total / max(message_total, 1),
+                text=(
+                    f"{indexed_total:,} of {message_total:,} messages "
+                    "fully indexed"
+                ),
+            )
+            if index_snapshot["current"]:
+                st.caption("Reading " + index_snapshot["current"])
+            st.caption(
+                f"{index_snapshot['partial']:,} partial · "
+                f"{index_snapshot['failed']:,} unavailable"
+            )
+            if st.button(
+                "Pause content indexing",
+                icon=":material/pause:",
+                width="stretch",
+            ):
+                stop_content_indexer(config)
+                st.rerun()
+        else:
+            st.markdown(
+                '<div class="sync-offline">Content indexer offline</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                f"{indexed_total:,} full · "
+                f"{index_snapshot['partial']:,} partial · "
+                f"{index_snapshot['failed']:,} unavailable"
+            )
+            if st.button(
+                "Resume content indexing",
+                icon=":material/play_arrow:",
+                width="stretch",
+            ):
+                start_content_indexer(config)
+                st.rerun()
 
-    index_snapshot = indexer_snapshot(config)
-    indexed_total = int(stats["indexed"] or 0)
-    message_total = int(stats["messages"] or 0)
-    if index_snapshot["alive"]:
+    with st.expander(
+        "Library health",
+        icon=":material/monitoring:",
+    ):
         st.markdown(
-            '<div class="sync-online">Content indexer online</div>',
-            unsafe_allow_html=True,
+            f"**{int(stats['total'] or 0):,}** captures  \n"
+            f"**{starred_count:,}** saved  \n"
+            f"**{int(stats['media'] or 0):,}** attachments  \n"
+            f"**{int(stats['links'] or 0):,}** links"
         )
         st.progress(
             indexed_total / max(message_total, 1),
-            text=(
-                f"{indexed_total:,} of {message_total:,} messages "
-                "fully indexed"
-            ),
-        )
-        if index_snapshot["current"]:
-            st.caption("Reading " + index_snapshot["current"])
-        st.caption(
-            f"{index_snapshot['partial']:,} partial · "
-            f"{index_snapshot['failed']:,} unavailable"
-        )
-        if st.button(
-            "Pause content indexing",
-            icon=":material/pause:",
-            width="stretch",
-        ):
-            stop_content_indexer(config)
-            st.rerun()
-    else:
-        st.markdown(
-            '<div class="sync-offline">Content indexer offline</div>',
-            unsafe_allow_html=True,
+            text=f"{indexed_total:,} of {message_total:,} searchable",
         )
         st.caption(
-            f"{indexed_total:,} full · "
-            f"{index_snapshot['partial']:,} partial · "
-            f"{index_snapshot['failed']:,} unavailable"
+            f"{int(stats['sensitive'] or 0):,} sensitive items protected."
         )
-        if st.button(
-            "Resume content indexing",
-            icon=":material/play_arrow:",
-            width="stretch",
-        ):
-            start_content_indexer(config)
-            st.rerun()
+        st.caption(
+            f"{int(stats['duplicates'] or 0):,} duplicate media items hidden; "
+            "originals retained."
+        )
+        st.caption(
+            "Semantic search "
+            + ("enabled." if config.enable_embeddings else "is optional.")
+        )
 
-    st.divider()
-
-    content_label = st.selectbox(
-        "Content type",
-        list(CONTENT_TYPES),
-        key="content_filter",
-        on_change=reset_page,
-    )
-    selected_topic = st.selectbox(
-        "Topic",
-        available_topics,
-        key="topic_filter",
-        on_change=reset_page,
-    )
-    date_window = st.selectbox(
-        "Date",
-        list(DATE_WINDOWS),
-        key="date_filter",
-        on_change=reset_page,
-    )
-    sort_order = st.selectbox(
-        "Sort",
-        ["Most relevant", "Newest first", "Oldest first"],
-        key="sort_filter",
-        on_change=reset_page,
-    )
-    page_size = st.select_slider(
-        "Results per page",
-        options=[10, 20, 30, 50],
-        value=20,
-        on_change=reset_page,
-    )
-
-    st.divider()
-    st.caption(
-        f"{stats['sensitive'] or 0} sensitive item(s) protected and hidden."
-    )
-    st.caption(
-        f"{stats['duplicates'] or 0} repeated media item(s) hidden; "
-        "originals retained."
-    )
-    st.caption(
-        "Semantic search "
-        + ("enabled." if config.enable_embeddings else "is optional.")
-    )
-
-header_left, header_right = st.columns([4, 1], vertical_alignment="bottom")
+header_left, header_right = st.columns([10, 1], vertical_alignment="center")
 with header_left:
     st.markdown(
         '<div class="app-title">Telegram Brain</div>'
         '<div class="app-subtitle">'
-        "Search the things you sent yourself. Save the useful ones."
+        "Find the text, links, documents and media you sent yourself."
         "</div>",
         unsafe_allow_html=True,
     )
 with header_right:
     if st.button(
-        "Refresh",
+        "",
         icon=":material/refresh:",
-        width="stretch",
+        width="content",
         help="Reload newly indexed messages",
     ):
         st.rerun()
 
+st.markdown(
+    '<div class="status-strip">'
+    '<span class="status-item">'
+    f'<span class="status-dot{" online" if sync_online else ""}"></span>'
+    f'{"Sync live" if sync_online else "Sync needs attention"}'
+    "</span>"
+    '<span class="status-item">'
+    f'<span class="status-dot{" online" if index_online else ""}"></span>'
+    f'{"Indexer live" if index_online else "Indexer paused"}'
+    "</span>"
+    f'<span class="status-item">{int(stats["total"] or 0):,} captures</span>'
+    f'<span class="status-item">{starred_count:,} saved</span>'
+    "</div>",
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    '<div class="search-label">Find anything</div>',
+    unsafe_allow_html=True,
+)
+
 q = st.text_input(
     "Search",
-    placeholder="Search your archive",
+    placeholder="Search captions, images, links or filenames",
     key="search_query",
     label_visibility="collapsed",
     on_change=reset_page,
@@ -972,36 +1058,10 @@ scope = st.segmented_control(
 )
 
 st.markdown(
-    """
-    <div class="metric-grid">
-        <div class="metric-item">
-            <div class="metric-label">Captures</div>
-            <div class="metric-value">{captures:,}</div>
-        </div>
-        <div class="metric-item">
-            <div class="metric-label">Saved</div>
-            <div class="metric-value">{saved:,}</div>
-        </div>
-        <div class="metric-item">
-            <div class="metric-label">Messages indexed</div>
-            <div class="metric-value">{indexed:,}</div>
-        </div>
-        <div class="metric-item">
-            <div class="metric-label">Attachments</div>
-            <div class="metric-value">{media:,}</div>
-        </div>
-        <div class="metric-item">
-            <div class="metric-label">Links</div>
-            <div class="metric-value">{links:,}</div>
-        </div>
-    </div>
-    """.format(
-        captures=stats["total"],
-        saved=starred_count,
-        indexed=stats["indexed"] or 0,
-        media=stats["media"] or 0,
-        links=stats["links"] or 0,
-    ),
+    '<div class="library-context">'
+    "Search checks captions, extracted document text, voice transcripts, "
+    "image understanding, filenames and link metadata."
+    "</div>",
     unsafe_allow_html=True,
 )
 
@@ -1017,7 +1077,10 @@ home_mode = (
 if home_mode:
     if latest_row:
         st.markdown(
-            '<div class="section-title">Latest capture</div>',
+            '<div class="section-title">Pick up where you left off</div>'
+            '<div class="section-subtitle">'
+            "Your newest capture, ready to reuse."
+            "</div>",
             unsafe_allow_html=True,
         )
         with st.container(border=True):
@@ -1055,20 +1118,14 @@ if home_mode:
                     unsafe_allow_html=True,
                 )
                 capture_meta = (
-                    f"{latest_row.get('capture_size', 1)} linked messages · "
+                    f"{latest_row.get('capture_size', 1)} Telegram messages · "
                     if latest_row.get("capture_size", 1) > 1
                     else ""
                 )
                 st.markdown(
                     '<div class="result-meta">'
-                    + "Added to "
-                    + html.escape(latest_category)
-                    + " · "
-                    + html.escape(format_date(latest_row["date_utc"]))
-                    + " · "
                     + html.escape(capture_meta)
-                    + "latest message "
-                    + html.escape(str(latest_row["message_id"]))
+                    + html.escape(format_date(latest_row["date_utc"]))
                     + "</div>",
                     unsafe_allow_html=True,
                 )
@@ -1091,7 +1148,7 @@ if home_mode:
                     key="open-latest-bucket",
                     on_click=open_bucket,
                     args=(latest_category,),
-                    width="stretch",
+                    width="content",
                 )
             render_copy_actions(
                 latest_row,
@@ -1103,7 +1160,10 @@ if home_mode:
             )
 
     st.markdown(
-        '<div class="section-title">Buckets</div>',
+        '<div class="section-title">Browse by topic</div>'
+        '<div class="section-subtitle">'
+        "Jump into a part of your archive without writing a query."
+        "</div>",
         unsafe_allow_html=True,
     )
     for row_start in range(0, len(bucket_rows), 3):
@@ -1142,14 +1202,18 @@ if home_mode:
     connection.close()
     st.stop()
 
-active_label = selected_topic
+active_label = "Library"
 if q:
-    active_label = f'Search: "{clean_preview(q, 50)}"'
+    active_label = f'Results for "{clean_preview(q, 50)}"'
 elif scope != "All":
     active_label = scope
+elif selected_topic != "All topics":
+    active_label = selected_topic
+elif content_label != "Everything":
+    active_label = content_label
 
 library_header, home_action = st.columns(
-    [4, 1],
+    [8, 1],
     vertical_alignment="center",
 )
 with library_header:
@@ -1162,7 +1226,7 @@ with home_action:
         "Home",
         icon=":material/home:",
         on_click=show_homepage,
-        width="stretch",
+        width="content",
     )
 
 rows = search(
@@ -1201,7 +1265,27 @@ elif sort_order == "Oldest first":
     )
 
 result_label = "result" if len(rows) == 1 else "results"
-st.caption(f"{len(rows):,} {result_label}")
+active_filters = []
+if selected_topic != "All topics" and selected_topic != active_label:
+    active_filters.append(selected_topic)
+if content_label != "Everything":
+    active_filters.append(content_label)
+if date_window != "Any time":
+    active_filters.append(date_window)
+if sort_order != "Most relevant":
+    active_filters.append(sort_order)
+filter_context = (
+    " · " + " · ".join(active_filters)
+    if active_filters
+    else ""
+)
+st.markdown(
+    '<div class="result-count">'
+    + f"{len(rows):,} {result_label}"
+    + html.escape(filter_context)
+    + "</div>",
+    unsafe_allow_html=True,
+)
 
 if not rows:
     if q and config.enable_vision and int(stats["visual_pending"] or 0):
@@ -1269,7 +1353,8 @@ for row in page_rows:
         with main:
             st.badge(category, color="gray")
             status_label, status_color = index_label(row)
-            st.badge(status_label, color=status_color)
+            if row.get("content_status") != "ready":
+                st.badge(status_label, color=status_color)
             if row.get("_duplicate_count"):
                 st.badge(
                     f"{row['_duplicate_count']} repeats avoided",
@@ -1281,12 +1366,11 @@ for row in page_rows:
             )
             meta_bits = [
                 format_date(row.get("date_utc")),
-                (
-                    f"{row.get('capture_size')} Telegram messages"
-                    if row.get("capture_size", 1) > 1
-                    else f"message {row.get('message_id')}"
-                ),
             ]
+            if row.get("capture_size", 1) > 1:
+                meta_bits.append(
+                    f"{row.get('capture_size')} Telegram messages"
+                )
             if row.get("sender_name"):
                 meta_bits.append(str(row["sender_name"]))
             st.markdown(
@@ -1309,7 +1393,7 @@ for row in page_rows:
                     else "Save for later"
                 ),
                 key=f"star-{row['id']}",
-                width="stretch",
+                width="content",
             ):
                 set_item_state(
                     connection,
@@ -1379,7 +1463,7 @@ for row in page_rows:
         if note:
             st.caption(f"Note: {clean_preview(note, 120)}")
 
-        with st.expander("Why this result"):
+        with st.expander("Why it matched"):
             for reason in row.get("_match_reasons") or [
                 "Shown by the current library filters"
             ]:
