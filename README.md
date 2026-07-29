@@ -19,7 +19,7 @@ Telegram's service chat when you use it as a personal inbox.
 - Searches original text, OCR, documents, transcripts, link metadata and
   filenames with SQLite FTS5.
 - Explains why each result matched and whether every part has been indexed.
-- Organises results by topic, type and date.
+- Organises results by topic and type while keeping chronology in the database.
 - Copies full text, individual or grouped web links, paste-ready images,
   original GIFs/videos/documents and multi-asset albums directly to the
   macOS clipboard.

@@ -309,15 +309,6 @@ CONTENT_TYPES = {
     "Documents": "document",
 }
 
-DATE_WINDOWS = {
-    "Any time": None,
-    "Last 7 days": 7,
-    "Last 30 days": 30,
-    "Last 90 days": 90,
-    "Last year": 365,
-}
-
-
 def reset_page() -> None:
     st.session_state.page = 1
 
@@ -325,8 +316,6 @@ def reset_page() -> None:
 def open_bucket(category: str) -> None:
     st.session_state.topic_filter = category
     st.session_state.content_filter = "Everything"
-    st.session_state.date_filter = "Any time"
-    st.session_state.sort_filter = "Newest first"
     st.session_state.scope_filter = "All"
     st.session_state.search_query = ""
     st.session_state.page = 1
@@ -335,8 +324,6 @@ def open_bucket(category: str) -> None:
 def show_homepage() -> None:
     st.session_state.topic_filter = "All topics"
     st.session_state.content_filter = "Everything"
-    st.session_state.date_filter = "Any time"
-    st.session_state.sort_filter = "Most relevant"
     st.session_state.scope_filter = "All"
     st.session_state.search_query = ""
     st.session_state.page = 1
@@ -356,14 +343,6 @@ def parse_link_metadata(row: dict) -> list[dict]:
     except (TypeError, json.JSONDecodeError):
         return []
     return [value for value in values if isinstance(value, dict)]
-
-
-def format_date(value: str) -> str:
-    try:
-        parsed = datetime.fromisoformat(value)
-        return parsed.astimezone().strftime("%d %b %Y, %H:%M")
-    except (TypeError, ValueError):
-        return str(value)[:19].replace("T", " ")
 
 
 def row_datetime(value: str) -> datetime:
@@ -849,24 +828,6 @@ with st.sidebar:
         key="topic_filter",
         on_change=reset_page,
     )
-    date_window = st.selectbox(
-        "Date",
-        list(DATE_WINDOWS),
-        key="date_filter",
-        on_change=reset_page,
-    )
-    sort_order = st.selectbox(
-        "Sort",
-        ["Most relevant", "Newest first", "Oldest first"],
-        key="sort_filter",
-        on_change=reset_page,
-    )
-    page_size = st.select_slider(
-        "Results per page",
-        options=[10, 20, 30, 50],
-        value=20,
-        on_change=reset_page,
-    )
 
     def sync_status_panel(snapshot: dict) -> None:
         if snapshot["alive"] and snapshot["status"] == "online":
@@ -1001,6 +962,8 @@ with st.sidebar:
             + ("enabled." if config.enable_embeddings else "is optional.")
         )
 
+page_size = 20
+
 header_left, header_right = st.columns([10, 1], vertical_alignment="center")
 with header_left:
     st.markdown(
@@ -1070,8 +1033,6 @@ home_mode = (
     and scope == "All"
     and selected_topic == "All topics"
     and content_label == "Everything"
-    and date_window == "Any time"
-    and sort_order == "Most relevant"
 )
 
 if home_mode:
@@ -1079,7 +1040,7 @@ if home_mode:
         st.markdown(
             '<div class="section-title">Pick up where you left off</div>'
             '<div class="section-subtitle">'
-            "Your newest capture, ready to reuse."
+            "Ready to reuse without digging through Telegram."
             "</div>",
             unsafe_allow_html=True,
         )
@@ -1117,18 +1078,15 @@ if home_mode:
                     + "</div>",
                     unsafe_allow_html=True,
                 )
-                capture_meta = (
-                    f"{latest_row.get('capture_size', 1)} Telegram messages · "
-                    if latest_row.get("capture_size", 1) > 1
-                    else ""
-                )
-                st.markdown(
-                    '<div class="result-meta">'
-                    + html.escape(capture_meta)
-                    + html.escape(format_date(latest_row["date_utc"]))
-                    + "</div>",
-                    unsafe_allow_html=True,
-                )
+                if latest_row.get("capture_size", 1) > 1:
+                    st.markdown(
+                        '<div class="result-meta">'
+                        + html.escape(
+                            f"{latest_row.get('capture_size')} linked messages"
+                        )
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
                 if latest_preview:
                     display_preview = re.sub(
                         r"(?m)^#{1,6}\s+",
@@ -1183,7 +1141,7 @@ if home_mode:
                         "</div>",
                         unsafe_allow_html=True,
                     )
-                    st.caption("items · newest " + format_date(bucket["date_utc"]))
+                    st.caption("captures")
                     st.markdown(
                         '<div class="bucket-latest">'
                         + html.escape(clean_preview(bucket_title, 84))
@@ -1241,27 +1199,13 @@ rows = search(
 )
 rows = process_scope(rows, scope)
 
-days = DATE_WINDOWS[date_window]
-if days is not None:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = [
-        row for row in rows if row_datetime(row.get("date_utc")) >= cutoff
-    ]
-
-if sort_order == "Newest first" or (not q and sort_order == "Most relevant"):
+if not q:
     rows.sort(
         key=lambda row: (
             row_datetime(row["date_utc"]),
             row["message_id"],
         ),
         reverse=True,
-    )
-elif sort_order == "Oldest first":
-    rows.sort(
-        key=lambda row: (
-            row_datetime(row["date_utc"]),
-            row["message_id"],
-        )
     )
 
 result_label = "result" if len(rows) == 1 else "results"
@@ -1270,10 +1214,6 @@ if selected_topic != "All topics" and selected_topic != active_label:
     active_filters.append(selected_topic)
 if content_label != "Everything":
     active_filters.append(content_label)
-if date_window != "Any time":
-    active_filters.append(date_window)
-if sort_order != "Most relevant":
-    active_filters.append(sort_order)
 filter_context = (
     " · " + " · ".join(active_filters)
     if active_filters
@@ -1364,21 +1304,15 @@ for row in page_rows:
                 f'<div class="result-title">{html.escape(title)}</div>',
                 unsafe_allow_html=True,
             )
-            meta_bits = [
-                format_date(row.get("date_utc")),
-            ]
             if row.get("capture_size", 1) > 1:
-                meta_bits.append(
-                    f"{row.get('capture_size')} Telegram messages"
+                st.markdown(
+                    '<div class="result-meta">'
+                    + html.escape(
+                        f"{row.get('capture_size')} linked messages"
+                    )
+                    + "</div>",
+                    unsafe_allow_html=True,
                 )
-            if row.get("sender_name"):
-                meta_bits.append(str(row["sender_name"]))
-            st.markdown(
-                '<div class="result-meta">'
-                + " · ".join(html.escape(bit) for bit in meta_bits)
-                + "</div>",
-                unsafe_allow_html=True,
-            )
         with action:
             if st.button(
                 "",
