@@ -14,6 +14,9 @@ Telegram's service chat when you use it as a personal inbox.
 - Combines adjacent message parts and media albums into one capture.
 - Keeps the earliest media asset and hides exact or safely detected re-encoded
   repeat shares from the visible library.
+- Mirrors the chat's current pins, surfaces safe pinned captures on Home and
+  keeps a dedicated Pinned library view in sync when items are pinned or
+  unpinned.
 - Shows live-sync health inside the dashboard.
 - Opens on a history-driven bucket homepage with the newest classified capture.
 - Searches original text, OCR, documents, transcripts, link metadata and

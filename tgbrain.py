@@ -16,8 +16,10 @@ from typing import Iterable
 
 import requests
 from dotenv import load_dotenv
+from mnemonic import Mnemonic
 from PIL import Image, ImageOps
 from telethon import TelegramClient
+from telethon.tl.types import InputMessagesFilterPinned
 
 from media_dedupe import (
     find_duplicate,
@@ -28,10 +30,11 @@ from media_dedupe import (
 load_dotenv()
 
 URL_RE = re.compile(r"https?://[^\s<>\]\)]+", re.IGNORECASE)
-METADATA_VERSION = 8
+METADATA_VERSION = 9
 ENRICHMENT_VERSION = 4
 CAPTURE_VERSION = 1
 _INITIALIZED_DATABASES: set[str] = set()
+MNEMONIC = Mnemonic("english")
 
 SECRET_PATTERNS = (
     (
@@ -78,6 +81,11 @@ LONG_CREDENTIAL_RE = re.compile(r"(?<![\w/])[A-Za-z0-9_+%=/.-]{28,}(?![\w/])")
 SENSITIVE_FILE_RE = re.compile(
     r"(?:account|acct|bank|statement|itr|tax|passport|aadhaar|pan[ _-]?card|"
     r"questionnaire|private[ _-]?key)",
+    re.IGNORECASE,
+)
+SEED_LABEL_RE = re.compile(
+    r"^\s*(?:(?:wallet|crypto)\s+)?"
+    r"(?:seed|recovery|mnemonic)(?:\s+phrase)?\s*[:=-]?\s*",
     re.IGNORECASE,
 )
 
@@ -412,6 +420,7 @@ CREATE TABLE IF NOT EXISTS messages(
     is_sensitive INTEGER NOT NULL DEFAULT 0,
     sensitive_reason TEXT,
     metadata_version INTEGER NOT NULL DEFAULT 0,
+    is_pinned INTEGER NOT NULL DEFAULT 0,
     UNIQUE(chat_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_date ON messages(date_utc DESC);
@@ -508,6 +517,7 @@ def _migrate(connection: sqlite3.Connection) -> None:
         "duplicate_reason": "TEXT",
         "duplicate_distance": "REAL",
         "fingerprint_version": "INTEGER NOT NULL DEFAULT 0",
+        "is_pinned": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, definition in additions.items():
         if name not in columns:
@@ -539,6 +549,9 @@ def _migrate(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_duplicate_of "
         "ON messages(duplicate_of_id)"
     )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pinned ON messages(is_pinned)"
+    )
     connection.commit()
 
 
@@ -564,6 +577,7 @@ def db(path: Path | str) -> sqlite3.Connection:
         ).fetchone()
         if needs_capture_refresh:
             rebuild_captures(connection)
+        refresh_metadata(connection)
         _INITIALIZED_DATABASES.add(resolved)
     return connection
 
@@ -676,6 +690,9 @@ def sensitive_status(
     if PIN_RE.search(value) or NUMERIC_SECRET_RE.fullmatch(value):
         return True, "PIN or numeric credential"
 
+    if contains_recovery_phrase(value):
+        return True, "wallet recovery phrase"
+
     if FINANCIAL_TRANSACTION_RE.search(value):
         return True, "financial transaction"
 
@@ -685,10 +702,26 @@ def sensitive_status(
     return False, None
 
 
+def contains_recovery_phrase(text: str | None) -> bool:
+    value = text or ""
+    candidates = [value, *value.splitlines()]
+    for candidate in candidates:
+        candidate = SEED_LABEL_RE.sub("", candidate.strip())
+        words = re.findall(r"[a-z]+", candidate.lower())
+        if len(words) not in {12, 15, 18, 21, 24}:
+            continue
+        normalized = " ".join(words)
+        if MNEMONIC.check(normalized):
+            return True
+    return False
+
+
 def mask_sensitive_text(text: str | None) -> str:
     value = text or ""
     if not value:
         return ""
+    if contains_recovery_phrase(value):
+        return "[hidden recovery phrase]"
 
     masked = value
     for _, pattern in SECRET_PATTERNS:
@@ -1146,6 +1179,7 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
     enriched.setdefault("capture_position", 0)
     enriched.setdefault("capture_version", 0)
     enriched.setdefault("fingerprint_version", 0)
+    enriched.setdefault("is_pinned", 0)
     enriched["indexed_text"] = build_indexed_text(enriched)
     enriched.update(message_metadata(enriched))
     inherited = _inherited_category(connection, enriched)
@@ -1186,6 +1220,7 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         "is_sensitive",
         "sensitive_reason",
         "metadata_version",
+        "is_pinned",
     ]
     placeholders = ",".join("?" * len(columns))
     updates = ",".join(
@@ -1326,9 +1361,58 @@ async def ingest(
                 if getattr(message, "grouped_id", None)
                 else None
             ),
+            "is_pinned": int(bool(getattr(message, "pinned", False))),
         },
     )
     return True
+
+
+async def sync_pinned_messages(
+    telegram: TelegramClient,
+    config: Settings,
+    connection: sqlite3.Connection,
+    entity,
+) -> int:
+    pinned_messages = []
+    async for message in telegram.iter_messages(
+        entity,
+        filter=InputMessagesFilterPinned,
+    ):
+        pinned_messages.append(message)
+
+    pinned_ids = {int(message.id) for message in pinned_messages}
+    known_ids = {
+        int(row["message_id"])
+        for row in connection.execute(
+            "SELECT message_id FROM messages WHERE chat_id = ?",
+            (config.chat_id,),
+        ).fetchall()
+    }
+    for message in pinned_messages:
+        if int(message.id) not in known_ids:
+            await ingest(telegram, config, connection, message)
+
+    connection.execute(
+        "UPDATE messages SET is_pinned = 0 WHERE chat_id = ?",
+        (config.chat_id,),
+    )
+    if pinned_ids:
+        ordered_ids = sorted(pinned_ids)
+        for start in range(0, len(ordered_ids), 400):
+            batch = ordered_ids[start : start + 400]
+            placeholders = ",".join("?" * len(batch))
+            connection.execute(
+                f"""
+                UPDATE messages
+                SET is_pinned = 1
+                WHERE chat_id = ?
+                  AND message_id IN ({placeholders})
+                """,
+                [config.chat_id, *batch],
+            )
+    connection.commit()
+    set_runtime_state(connection, "pinned_count", len(pinned_ids))
+    return len(pinned_ids)
 
 
 def cosine(left: list[float], right: list[float]) -> float:
@@ -1373,6 +1457,7 @@ def _base_filters(
     include_sensitive: bool,
     category: str | None,
     starred_only: bool,
+    pinned_only: bool,
 ) -> tuple[list[str], list]:
     clauses = ["m.duplicate_of_id IS NULL"]
     params: list = []
@@ -1388,6 +1473,24 @@ def _base_filters(
         params.append(category)
     if starred_only:
         clauses.append("COALESCE(s.starred, 0) = 1")
+    if pinned_only:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM messages pinned
+                WHERE pinned.chat_id = m.chat_id
+                  AND pinned.is_pinned = 1
+                  AND COALESCE(
+                      pinned.capture_id,
+                      pinned.chat_id || ':' || pinned.message_id
+                  ) = COALESCE(
+                      m.capture_id,
+                      m.chat_id || ':' || m.message_id
+                  )
+            )
+            """
+        )
     return clauses, params
 
 
@@ -1574,6 +1677,7 @@ def _combine_capture(parts: list[dict], query: str) -> dict:
                 media_items[0]["mime_type"] if media_items else None
             ),
             "starred": int(any(part.get("starred") for part in parts)),
+            "is_pinned": int(any(part.get("is_pinned") for part in parts)),
             "note": "\n".join(notes),
             "user_category": user_category,
             "category": category,
@@ -1682,12 +1786,14 @@ def search(
     include_sensitive: bool = False,
     category: str | None = None,
     starred_only: bool = False,
+    pinned_only: bool = False,
 ) -> list[dict]:
     clauses, filter_params = _base_filters(
         kind,
         include_sensitive,
         category,
         starred_only,
+        pinned_only,
     )
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     select = """

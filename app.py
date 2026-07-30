@@ -175,6 +175,28 @@ st.markdown(
             opacity: 0.64;
         }
 
+        .pinned-section {
+            border-left: 3px solid var(--brain-amber);
+            margin-top: 1.45rem;
+            padding-left: 0.75rem;
+        }
+
+        .pinned-title {
+            font-size: 1.02rem;
+            font-weight: 700;
+            line-height: 1.3;
+            margin: 0;
+        }
+
+        .pinned-preview {
+            font-size: 0.86rem;
+            line-height: 1.45;
+            margin: 0.35rem 0 0.65rem;
+            min-height: 3.75rem;
+            opacity: 0.78;
+            overflow-wrap: anywhere;
+        }
+
         .latest-preview {
             font-size: 0.94rem;
             line-height: 1.55;
@@ -329,6 +351,14 @@ def show_homepage() -> None:
     st.session_state.page = 1
 
 
+def open_pinned() -> None:
+    st.session_state.topic_filter = "All topics"
+    st.session_state.content_filter = "Everything"
+    st.session_state.scope_filter = "Pinned"
+    st.session_state.search_query = ""
+    st.session_state.page = 1
+
+
 def parse_urls(row: dict) -> list[str]:
     try:
         values = json.loads(row.get("urls_json") or "[]")
@@ -401,6 +431,8 @@ def result_title(row: dict) -> str:
 
 
 def process_scope(rows: list[dict], scope: str) -> list[dict]:
+    if scope == "Pinned":
+        return [row for row in rows if row.get("is_pinned")]
     if scope == "Saved":
         return [row for row in rows if row.get("starred")]
     if scope == "Links":
@@ -664,6 +696,12 @@ stats = connection.execute(
         SUM(CASE WHEN duplicate_of_id IS NULL THEN 1 ELSE 0 END)
             AS messages,
         SUM(CASE WHEN is_sensitive = 1 THEN 1 ELSE 0 END) AS sensitive,
+        COUNT(DISTINCT CASE
+            WHEN is_pinned = 1
+             AND is_sensitive = 0
+             AND duplicate_of_id IS NULL
+            THEN COALESCE(capture_id, chat_id || ':' || message_id)
+        END) AS pinned,
         SUM(CASE
             WHEN media_path IS NOT NULL AND duplicate_of_id IS NULL
             THEN 1 ELSE 0
@@ -803,6 +841,16 @@ latest_results = search(
     include_sensitive=False,
 )
 latest_row = latest_results[0] if latest_results else None
+pinned_results = search(
+    connection,
+    config,
+    "",
+    "all",
+    3,
+    include_sensitive=False,
+    pinned_only=True,
+)
+pinned_count = int(stats["pinned"] or 0)
 
 sync_snapshot = watcher_snapshot(config)
 index_snapshot = indexer_snapshot(config)
@@ -942,6 +990,7 @@ with st.sidebar:
     ):
         st.markdown(
             f"**{int(stats['total'] or 0):,}** captures  \n"
+            f"**{pinned_count:,}** pinned  \n"
             f"**{starred_count:,}** saved  \n"
             f"**{int(stats['media'] or 0):,}** attachments  \n"
             f"**{int(stats['links'] or 0):,}** links"
@@ -993,6 +1042,7 @@ st.markdown(
     f'{"Indexer live" if index_online else "Indexer paused"}'
     "</span>"
     f'<span class="status-item">{int(stats["total"] or 0):,} captures</span>'
+    f'<span class="status-item">{pinned_count:,} pinned</span>'
     f'<span class="status-item">{starred_count:,} saved</span>'
     "</div>",
     unsafe_allow_html=True,
@@ -1013,7 +1063,7 @@ q = st.text_input(
 
 scope = st.segmented_control(
     "Scope",
-    ["All", "Saved", "Links", "Media"],
+    ["All", "Pinned", "Saved", "Links", "Media"],
     key="scope_filter",
     on_change=reset_page,
     label_visibility="collapsed",
@@ -1036,6 +1086,64 @@ home_mode = (
 )
 
 if home_mode:
+    if pinned_results:
+        pinned_header, pinned_action = st.columns(
+            [8, 1],
+            vertical_alignment="center",
+        )
+        with pinned_header:
+            st.markdown(
+                '<div class="pinned-section">'
+                '<div class="pinned-title">Pinned essentials</div>'
+                '<div class="section-subtitle">'
+                "Important Telegram pins, kept close at hand."
+                "</div></div>",
+                unsafe_allow_html=True,
+            )
+        with pinned_action:
+            st.button(
+                "View all",
+                icon=":material/push_pin:",
+                on_click=open_pinned,
+                width="content",
+            )
+
+        pinned_columns = st.columns(len(pinned_results))
+        for column, pinned_row in zip(pinned_columns, pinned_results):
+            pinned_text = mask_sensitive_text(
+                pinned_row.get("text")
+                or pinned_row.get("extracted_text")
+                or ""
+            ).strip()
+            pinned_category = (
+                pinned_row.get("display_category") or "Uncategorised"
+            )
+            with column:
+                with st.container(border=True):
+                    st.badge("Pinned", color="orange")
+                    st.badge(pinned_category, color="gray")
+                    st.markdown(
+                        '<div class="result-title">'
+                        + html.escape(result_title(pinned_row))
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        '<div class="pinned-preview">'
+                        + html.escape(
+                            clean_preview(
+                                pinned_text or "Media saved without a caption.",
+                                150,
+                            )
+                        )
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+                    render_copy_actions(
+                        pinned_row,
+                        f"pinned-{pinned_row['id']}",
+                    )
+
     if latest_row:
         st.markdown(
             '<div class="section-title">Pick up where you left off</div>'
@@ -1196,6 +1304,7 @@ rows = search(
     include_sensitive=False,
     category=selected_topic,
     starred_only=scope == "Saved",
+    pinned_only=scope == "Pinned",
 )
 rows = process_scope(rows, scope)
 
@@ -1291,6 +1400,8 @@ for row in page_rows:
     with st.container(border=True):
         main, action = st.columns([12, 1], vertical_alignment="top")
         with main:
+            if row.get("is_pinned"):
+                st.badge("Pinned in Telegram", color="orange")
             st.badge(category, color="gray")
             status_label, status_color = index_label(row)
             if row.get("content_status") != "ready":
@@ -1398,6 +1509,8 @@ for row in page_rows:
             st.caption(f"Note: {clean_preview(note, 120)}")
 
         with st.expander("Why it matched"):
+            if row.get("is_pinned"):
+                st.markdown("- Pinned in the source Telegram chat")
             for reason in row.get("_match_reasons") or [
                 "Shown by the current library filters"
             ]:

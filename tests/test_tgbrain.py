@@ -1,11 +1,14 @@
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
+import tgbrain
 from content_indexing import apply_enrichment, enrich_record
 from media_dedupe import (
     backfill_media_duplicates,
@@ -21,6 +24,7 @@ from tgbrain import (
     search,
     sensitive_status,
     set_item_state,
+    sync_pinned_messages,
     upsert,
 )
 
@@ -117,6 +121,18 @@ class TelegramBrainTests(unittest.TestCase):
         credential = "sk-" + ("a" * 32) + "\nDeepSeek API key"
         self.assertTrue(sensitive_status(credential)[0])
         self.assertNotIn("sk-", mask_sensitive_text(credential))
+        public_test_mnemonic = " ".join(["abandon"] * 11 + ["about"])
+        self.assertTrue(sensitive_status(public_test_mnemonic)[0])
+        self.assertEqual(
+            mask_sensitive_text(public_test_mnemonic),
+            "[hidden recovery phrase]",
+        )
+        self.assertFalse(
+            sensitive_status(
+                "This ordinary twelve word sentence is not a wallet recovery "
+                "phrase at all"
+            )[0]
+        )
         self.assertTrue(
             sensitive_status(
                 "https://app.debridge.com/order?txHash=0x123"
@@ -228,6 +244,72 @@ class TelegramBrainTests(unittest.TestCase):
         self.assertEqual(capture["capture_size"], 2)
         self.assertIn(31, capture["message_ids"])
         self.assertIn("second part", capture["text"])
+
+    def test_pinned_scope_returns_the_entire_capture(self):
+        timestamp = "2026-07-20T12:00:00+00:00"
+        self.insert(
+            32,
+            "Pinned thesis with the core reasoning.",
+            date_utc=timestamp,
+        )
+        self.insert(
+            33,
+            "The chart attached to the same thought.",
+            media_type="image",
+            file_name="thesis-chart.png",
+            date_utc=timestamp,
+        )
+        self.connection.execute(
+            "UPDATE messages SET is_pinned = 1 WHERE message_id = 32"
+        )
+        self.connection.commit()
+
+        rows = search(
+            self.connection,
+            self.config,
+            "",
+            limit=20,
+            pinned_only=True,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["is_pinned"], 1)
+        self.assertEqual(rows[0]["capture_size"], 2)
+        self.assertEqual(rows[0]["message_ids"], [32, 33])
+
+    def test_pinned_sync_clears_stale_pin_flags(self):
+        self.insert(34, "An old Telegram pin")
+        self.insert(35, "The only current Telegram pin")
+        self.connection.execute(
+            "UPDATE messages SET is_pinned = 1 WHERE message_id = 34"
+        )
+        self.connection.commit()
+
+        class FakeTelegram:
+            async def iter_messages(self, _entity, **_kwargs):
+                yield SimpleNamespace(id=35)
+
+        count = asyncio.run(
+            sync_pinned_messages(
+                FakeTelegram(),
+                self.config,
+                self.connection,
+                object(),
+            )
+        )
+        states = {
+            row["message_id"]: row["is_pinned"]
+            for row in self.connection.execute(
+                """
+                SELECT message_id, is_pinned
+                FROM messages
+                WHERE message_id IN (34, 35)
+                """
+            ).fetchall()
+        }
+
+        self.assertEqual(count, 1)
+        self.assertEqual(states, {34: 0, 35: 1})
 
     def test_extracted_content_survives_a_telegram_resync(self):
         self.insert(
@@ -422,6 +504,34 @@ class TelegramBrainTests(unittest.TestCase):
             "PRAGMA journal_mode"
         ).fetchone()[0]
         self.assertEqual(mode.lower(), "wal")
+
+    def test_existing_database_adds_pinned_column_before_index(self):
+        self.connection.execute("DROP INDEX idx_pinned")
+        self.connection.execute(
+            "ALTER TABLE messages DROP COLUMN is_pinned"
+        )
+        self.connection.commit()
+        self.connection.close()
+        tgbrain._INITIALIZED_DATABASES.discard(
+            str(self.config.db_path.resolve())
+        )
+
+        self.connection = db(self.config.db_path)
+
+        columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(messages)"
+            ).fetchall()
+        }
+        indexes = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA index_list(messages)"
+            ).fetchall()
+        }
+        self.assertIn("is_pinned", columns)
+        self.assertIn("idx_pinned", indexes)
 
     def test_multi_term_search_prefers_complete_match(self):
         self.insert(60, "Social status can be measured in followers")

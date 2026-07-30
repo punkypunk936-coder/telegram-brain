@@ -10,6 +10,7 @@ from tgbrain import (
     ingest,
     set_runtime_state,
     settings,
+    sync_pinned_messages,
 )
 
 
@@ -31,11 +32,26 @@ async def catch_up(telegram, config, connection, entity) -> int:
     return imported
 
 
-async def heartbeat(connection) -> None:
+async def heartbeat(
+    connection,
+    telegram,
+    config,
+    entity,
+) -> None:
     while True:
         set_runtime_state(connection, "watcher_status", "online")
         set_runtime_state(connection, "watcher_pid", os.getpid())
-        await asyncio.sleep(20)
+        try:
+            await sync_pinned_messages(
+                telegram,
+                config,
+                connection,
+                entity,
+            )
+            set_runtime_state(connection, "watcher_error", "")
+        except Exception:
+            logging.exception("Pinned message sync failed")
+        await asyncio.sleep(60)
 
 
 async def main() -> None:
@@ -49,6 +65,12 @@ async def main() -> None:
         await telegram.start(phone=config.phone)
         entity = await telegram.get_entity(config.chat_id)
         imported = await catch_up(telegram, config, connection, entity)
+        pinned_count = await sync_pinned_messages(
+            telegram,
+            config,
+            connection,
+            entity,
+        )
         set_runtime_state(connection, "last_sync_count", imported)
         set_runtime_state(connection, "watcher_status", "online")
 
@@ -66,13 +88,23 @@ async def main() -> None:
             except Exception:
                 logging.exception("Ingest failed")
 
-        heartbeat_task = asyncio.create_task(heartbeat(connection))
+        heartbeat_task = asyncio.create_task(
+            heartbeat(
+                connection,
+                telegram,
+                config,
+                entity,
+            )
+        )
         print(
             "Watching chat",
             config.chat_id,
             "after importing",
             imported,
             "missed messages",
+            "and",
+            pinned_count,
+            "pins",
         )
         try:
             await telegram.run_until_disconnected()

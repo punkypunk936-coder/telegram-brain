@@ -28,6 +28,18 @@ def process_alive(pid: int | str | None) -> bool:
         os.kill(int(pid), 0)
     except (OSError, TypeError, ValueError):
         return False
+    try:
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(int(pid))],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        ).stdout.strip()
+        if state.startswith("Z"):
+            return False
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        pass
     return True
 
 

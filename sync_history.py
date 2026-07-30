@@ -7,6 +7,7 @@ from tgbrain import (
     ingest,
     set_runtime_state,
     settings,
+    sync_pinned_messages,
 )
 
 
@@ -37,9 +38,21 @@ async def sync_messages(limit: int | None, full: bool) -> int:
                 if imported % 50 == 0:
                     print("Imported", imported)
 
+        pinned_count = await sync_pinned_messages(
+            telegram,
+            config,
+            connection,
+            entity,
+        )
         set_runtime_state(connection, "last_sync_count", imported)
         set_runtime_state(connection, "sync_status", "idle")
-        print("Done:", imported, "new messages")
+        print(
+            "Done:",
+            imported,
+            "new messages and",
+            pinned_count,
+            "current pins",
+        )
         return imported
     except Exception as error:
         set_runtime_state(connection, "sync_status", "error")
