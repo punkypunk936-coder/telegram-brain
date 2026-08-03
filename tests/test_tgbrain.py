@@ -717,6 +717,23 @@ class TelegramBrainTests(unittest.TestCase):
 
         self.assertEqual(results, [])
 
+    def test_short_name_is_not_matched_inside_unrelated_words(self):
+        self.insert(
+            64,
+            "A maxi meme about existing market proxies",
+            media_type="image",
+            file_name="unrelated.jpg",
+        )
+
+        results = search(
+            self.connection,
+            self.config,
+            "xi jingping meme",
+            limit=20,
+        )
+
+        self.assertEqual(results, [])
+
     def _meme_canvas(self, variant: bool = False) -> Image.Image:
         image = Image.new("RGB", (720, 480), "#f2f2ed")
         draw = ImageDraw.Draw(image)

@@ -1977,37 +1977,58 @@ def search(
     if not found:
         terms = _query_terms(query)[:8]
         if terms:
-            if len(terms) == 1:
-                term_clause = "LOWER(m.indexed_text) LIKE ?"
-                term_params: list[Any] = [f"%{terms[0]}%"]
-            else:
-                coverage_clause = " + ".join(
-                    "CASE WHEN LOWER(m.indexed_text) LIKE ? THEN 1 ELSE 0 END"
-                    for _ in terms
-                )
-                term_clause = f"({coverage_clause}) >= ?"
-                term_params = [
-                    *(f"%{term}%" for term in terms),
-                    min(2, len(terms)),
-                ]
-            fallback_clauses = [f"({term_clause})", *clauses]
-            fallback_where = "WHERE " + " AND ".join(fallback_clauses)
             rows = connection.execute(
                 f"""
-                {select} {fallback_where}
+                {select} {where}
                 ORDER BY m.date_utc DESC, m.message_id DESC
-                LIMIT ?
                 """,
-                [
-                    *term_params,
-                    *filter_params,
-                    limit * 2,
-                ],
+                filter_params,
             ).fetchall()
-            for index, row in enumerate(rows):
+            person_terms = _person_query_terms(query)
+            candidates = []
+            for row in rows:
                 item = dict(row)
-                item["_keyword_score"] = 1 / (index + 1)
+                value_terms = {
+                    token.lower()
+                    for token in re.findall(
+                        r"[\w+#.-]+",
+                        item.get("indexed_text") or "",
+                        re.UNICODE,
+                    )
+                }
+                coverage = sum(
+                    1
+                    for term in terms
+                    if term in value_terms
+                    or (
+                        len(term) >= 4
+                        and any(
+                            token.startswith(term)
+                            for token in value_terms
+                        )
+                    )
+                )
+                if person_terms:
+                    if not _matches_people_field(
+                        item.get("vision_text"),
+                        person_terms,
+                    ):
+                        continue
+                    coverage = max(coverage, len(person_terms))
+                elif coverage < min(2, len(terms)):
+                    continue
+                item["_keyword_score"] = coverage / len(terms)
                 item["_semantic_score"] = 0.0
+                candidates.append(item)
+            candidates.sort(
+                key=lambda item: (
+                    item["_keyword_score"],
+                    item["date_utc"],
+                    item["message_id"],
+                ),
+                reverse=True,
+            )
+            for item in candidates[: limit * 2]:
                 found[item["id"]] = item
 
     if config.enable_embeddings:
