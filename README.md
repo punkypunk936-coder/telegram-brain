@@ -101,6 +101,16 @@ Open `http://127.0.0.1:8501`. The dashboard starts the live watcher in the
 background, catches up on anything missed while it was closed and progressively
 indexes the existing archive.
 
+To keep the dashboard online across crashes and Mac restarts, install its
+per-user launch service once:
+
+```bash
+./install_autostart.sh
+```
+
+The project must live outside macOS-protected `Desktop`, `Documents` and
+`Downloads` folders for a background launch service to read it.
+
 ### 6. Enable local voice transcription
 
 OCR and document extraction work after the normal setup. Voice notes need a
