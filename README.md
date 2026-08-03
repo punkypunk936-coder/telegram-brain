@@ -29,7 +29,7 @@ Telegram's service chat when you use it as a personal inbox.
 - Carries topic context across adjacent parts of the same long capture.
 - Lets you star useful items, add private notes and correct a topic.
 - Detects credentials and sensitive documents, then hides them from normal results.
-- Optionally adds local semantic search and image understanding through Ollama.
+- Adds local semantic search and detailed image understanding through Ollama.
 
 The collector is read-only: it does not send, edit, delete or forward Telegram
 messages.
@@ -118,8 +118,8 @@ hosted transcription service.
 Install Ollama, then:
 
 ```bash
-ollama pull embeddinggemma
-ollama pull moondream:1.8b
+ollama pull embeddinggemma:300m-qat-q4_0
+ollama pull qwen3-vl:2b-instruct
 ```
 
 Enable the models in `.env`:
@@ -130,6 +130,9 @@ ENABLE_VISION=true
 ```
 
 Exact keyword search remains available without Ollama.
+The image reader records which model and prompt produced each description. If
+either changes, existing images are re-read quietly in the background, with new
+images handled first.
 
 ## Privacy
 

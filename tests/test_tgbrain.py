@@ -9,7 +9,12 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 
 import tgbrain
-from content_indexing import apply_enrichment, enrich_record
+from content_indexing import (
+    apply_enrichment,
+    enrich_record,
+    next_pending,
+    pending_count,
+)
 from media_dedupe import (
     backfill_media_duplicates,
     find_duplicate,
@@ -17,6 +22,7 @@ from media_dedupe import (
 )
 from tgbrain import (
     Settings,
+    VISION_PROMPT_VERSION,
     build_indexed_text,
     db,
     detect_category,
@@ -457,6 +463,155 @@ class TelegramBrainTests(unittest.TestCase):
             "Matched an AI image description",
             results[0]["_match_reasons"],
         )
+        indexed = self.connection.execute(
+            """
+            SELECT vision_model, vision_prompt_version
+            FROM messages WHERE message_id = 55
+            """
+        ).fetchone()
+        self.assertEqual(indexed["vision_model"], vision_config.vision_model)
+        self.assertEqual(
+            indexed["vision_prompt_version"],
+            VISION_PROMPT_VERSION,
+        )
+
+    def test_changed_vision_model_queues_existing_images_for_a_reread(self):
+        root = Path(self.temp_dir.name)
+        image_path = root / "old-description.png"
+        self._meme_canvas().save(image_path)
+        self.insert(
+            57,
+            "",
+            media_type="image",
+            media_path=image_path,
+            file_name=image_path.name,
+        )
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET vision_text = ?, vision_model = ?,
+                vision_prompt_version = ?, content_status = 'ready',
+                enrichment_version = ?
+            WHERE message_id = 57
+            """,
+            (
+                "A generic image description from the old reader.",
+                "moondream:1.8b",
+                1,
+                tgbrain.ENRICHMENT_VERSION,
+            ),
+        )
+        self.connection.commit()
+
+        count = pending_count(
+            self.connection,
+            require_vision=True,
+            vision_model="qwen3-vl:2b-instruct",
+        )
+        queued = next_pending(
+            self.connection,
+            limit=5,
+            require_vision=True,
+            vision_model="qwen3-vl:2b-instruct",
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual([row["message_id"] for row in queued], [57])
+
+    def test_semantic_search_finds_a_described_image_without_shared_words(self):
+        self.insert(58, "", media_type="image", file_name="capture.jpg")
+        row = dict(
+            self.connection.execute(
+                "SELECT * FROM messages WHERE message_id = 58"
+            ).fetchone()
+        )
+        row["vision_text"] = (
+            "A national official speaking beside ceremonial flags."
+        )
+        row["indexed_text"] = build_indexed_text(row)
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET vision_text = ?, indexed_text = ?, embedding_json = ?,
+                embedding_model = ?
+            WHERE id = ?
+            """,
+            (
+                row["vision_text"],
+                row["indexed_text"],
+                json.dumps([1.0, 0.0]),
+                self.config.embed_model,
+                row["id"],
+            ),
+        )
+        self.connection.commit()
+        semantic_config = Settings(
+            **{**self.config.__dict__, "enable_embeddings": True}
+        )
+
+        with patch("tgbrain.embed", return_value=[1.0, 0.0]):
+            results = search(
+                self.connection,
+                semantic_config,
+                "Asian leader at a government event",
+                limit=20,
+            )
+
+        self.assertEqual([item["message_id"] for item in results], [58])
+        self.assertIn(
+            "Related by semantic meaning",
+            results[0]["_match_reasons"],
+        )
+
+    def test_semantic_name_search_allows_typos_but_rejects_other_people(self):
+        records = (
+            (59, "People: Donald Trump\nSummary: A political meme."),
+            (60, "People: Xi Jinping\nSummary: A formal public event."),
+        )
+        for message_id, description in records:
+            self.insert(
+                message_id,
+                "",
+                media_type="image",
+                file_name=f"person-{message_id}.jpg",
+            )
+            row = dict(
+                self.connection.execute(
+                    "SELECT * FROM messages WHERE message_id = ?",
+                    (message_id,),
+                ).fetchone()
+            )
+            row["vision_text"] = description
+            row["indexed_text"] = build_indexed_text(row)
+            self.connection.execute(
+                """
+                UPDATE messages
+                SET vision_text = ?, indexed_text = ?, embedding_json = ?,
+                    embedding_model = ?
+                WHERE id = ?
+                """,
+                (
+                    description,
+                    row["indexed_text"],
+                    json.dumps([1.0, 0.0]),
+                    self.config.embed_model,
+                    row["id"],
+                ),
+            )
+        self.connection.commit()
+        semantic_config = Settings(
+            **{**self.config.__dict__, "enable_embeddings": True}
+        )
+
+        with patch("tgbrain.embed", return_value=[1.0, 0.0]):
+            results = search(
+                self.connection,
+                semantic_config,
+                "xi jingping meme",
+                limit=20,
+            )
+
+        self.assertEqual([item["message_id"] for item in results], [60])
 
     def test_unhelpful_image_description_is_not_indexed(self):
         root = Path(self.temp_dir.name)
@@ -531,6 +686,9 @@ class TelegramBrainTests(unittest.TestCase):
             ).fetchall()
         }
         self.assertIn("is_pinned", columns)
+        self.assertIn("vision_model", columns)
+        self.assertIn("vision_prompt_version", columns)
+        self.assertIn("vision_attempted_at", columns)
         self.assertIn("idx_pinned", indexes)
 
     def test_multi_term_search_prefers_complete_match(self):

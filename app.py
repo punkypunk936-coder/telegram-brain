@@ -22,6 +22,7 @@ from service_control import (
     watcher_snapshot,
 )
 from tgbrain import (
+    VISION_PROMPT_VERSION,
     db,
     get_runtime_state,
     mask_sensitive_text,
@@ -392,6 +393,32 @@ def clean_preview(value: str, limit: int = 520) -> str:
     return compact[: limit - 1].rstrip() + "…"
 
 
+def visual_preview(value: str) -> str:
+    if not value.strip():
+        return ""
+    fields = {}
+    for label in ("summary", "people", "meme context"):
+        match = re.search(
+            rf"(?im)^{re.escape(label)}\s*:\s*(.+)$",
+            value,
+        )
+        if match:
+            fields[label] = match.group(1).strip()
+    pieces = []
+    people = fields.get("people", "")
+    if people.lower() not in {"", "none", "unknown"}:
+        pieces.append(people)
+    if fields.get("summary"):
+        pieces.append(fields["summary"])
+    if fields.get("meme context", "").lower() not in {
+        "",
+        "none",
+        "not applicable",
+    }:
+        pieces.append(fields["meme context"])
+    return clean_preview(" · ".join(pieces) or value, 420)
+
+
 def result_title(row: dict) -> str:
     text = (row.get("text") or "").strip()
     if text:
@@ -718,7 +745,11 @@ stats = connection.execute(
         SUM(CASE
             WHEN media_type = 'image'
              AND media_path IS NOT NULL
-             AND TRIM(vision_text) = ''
+             AND (
+                TRIM(vision_text) = ''
+                OR COALESCE(vision_model, '') != ?
+                OR vision_prompt_version < ?
+             )
              AND duplicate_of_id IS NULL
             THEN 1 ELSE 0
         END)
@@ -727,7 +758,8 @@ stats = connection.execute(
             AS duplicates,
         MAX(date_utc) AS latest
     FROM messages
-    """
+    """,
+    (config.vision_model, VISION_PROMPT_VERSION),
 ).fetchone()
 starred_count = connection.execute(
     """
@@ -1055,7 +1087,7 @@ st.markdown(
 
 q = st.text_input(
     "Search",
-    placeholder="Search captions, images, links or filenames",
+    placeholder="Describe a person, scene, meme or text you remember",
     key="search_query",
     label_visibility="collapsed",
     on_change=reset_page,
@@ -1072,8 +1104,8 @@ scope = st.segmented_control(
 
 st.markdown(
     '<div class="library-context">'
-    "Search checks captions, extracted document text, voice transcripts, "
-    "image understanding, filenames and link metadata."
+    "Describe what you remember. Search checks what is visible in images, "
+    "captions, documents, voice notes, filenames and links."
     "</div>",
     unsafe_allow_html=True,
 )
@@ -1339,9 +1371,9 @@ st.markdown(
 if not rows:
     if q and config.enable_vision and int(stats["visual_pending"] or 0):
         st.warning(
-            "No indexed match yet. The background image reader is still "
-            f"analyzing {int(stats['visual_pending']):,} older images; "
-            "new images are handled first.",
+            "No confident match yet. The upgraded image reader is still "
+            f"re-reading {int(stats['visual_pending']):,} older images in "
+            "the background; new images are handled first.",
             icon=":material/image_search:",
         )
     else:
@@ -1392,6 +1424,9 @@ for row in page_rows:
     text = mask_sensitive_text(row.get("text") or "").strip()
     extracted_text = mask_sensitive_text(
         row.get("extracted_text") or ""
+    ).strip()
+    vision_text = mask_sensitive_text(
+        row.get("vision_text") or ""
     ).strip()
     title = result_title({**row, "text": text})
     category = row.get("display_category") or row.get("category")
@@ -1464,6 +1499,8 @@ for row in page_rows:
                     st.write(clean_preview(text))
                 elif extracted_text:
                     st.write(clean_preview(extracted_text))
+                elif vision_text:
+                    st.write(visual_preview(vision_text))
                 else:
                     st.caption("Image saved without a caption.")
         elif images:
@@ -1475,6 +1512,8 @@ for row in page_rows:
                 st.write(clean_preview(text))
             elif extracted_text:
                 st.write(clean_preview(extracted_text))
+            elif vision_text:
+                st.write(visual_preview(vision_text))
         else:
             if text:
                 st.write(clean_preview(text))
@@ -1535,6 +1574,9 @@ for row in page_rows:
             if extracted_text:
                 st.markdown("**Indexed content preview**")
                 st.write(clean_preview(extracted_text, 900))
+            if vision_text:
+                st.markdown("**What the image reader saw**")
+                st.write(clean_preview(vision_text, 900))
 
         with st.expander("Organise"):
             editor_left, editor_right = st.columns([1, 2])

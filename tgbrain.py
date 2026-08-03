@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from difflib import SequenceMatcher
 import io
 import json
 import math
@@ -33,8 +34,52 @@ URL_RE = re.compile(r"https?://[^\s<>\]\)]+", re.IGNORECASE)
 METADATA_VERSION = 9
 ENRICHMENT_VERSION = 4
 CAPTURE_VERSION = 1
+VISION_PROMPT_VERSION = 2
+SEMANTIC_MIN_SCORE = 0.40
 _INITIALIZED_DATABASES: set[str] = set()
 MNEMONIC = Mnemonic("english")
+SEARCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "for",
+    "from",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
+PERSON_QUERY_GENERIC = {
+    "asian",
+    "black",
+    "boy",
+    "chinese",
+    "find",
+    "girl",
+    "government",
+    "image",
+    "jacket",
+    "leader",
+    "leather",
+    "man",
+    "meme",
+    "person",
+    "photo",
+    "picture",
+    "politician",
+    "president",
+    "red",
+    "show",
+    "standing",
+    "suit",
+    "video",
+    "woman",
+}
 
 SECRET_PATTERNS = (
     (
@@ -397,8 +442,13 @@ CREATE TABLE IF NOT EXISTS messages(
     mime_type TEXT,
     urls_json TEXT NOT NULL DEFAULT '[]',
     vision_text TEXT NOT NULL DEFAULT '',
+    vision_model TEXT NOT NULL DEFAULT '',
+    vision_prompt_version INTEGER NOT NULL DEFAULT 0,
+    vision_attempted_at TEXT,
     indexed_text TEXT NOT NULL DEFAULT '',
     embedding_json TEXT,
+    embedding_model TEXT NOT NULL DEFAULT '',
+    embedding_attempted_at TEXT,
     extracted_text TEXT NOT NULL DEFAULT '',
     link_metadata_json TEXT NOT NULL DEFAULT '[]',
     content_status TEXT NOT NULL DEFAULT 'pending',
@@ -518,6 +568,11 @@ def _migrate(connection: sqlite3.Connection) -> None:
         "duplicate_distance": "REAL",
         "fingerprint_version": "INTEGER NOT NULL DEFAULT 0",
         "is_pinned": "INTEGER NOT NULL DEFAULT 0",
+        "vision_model": "TEXT NOT NULL DEFAULT ''",
+        "vision_prompt_version": "INTEGER NOT NULL DEFAULT 0",
+        "vision_attempted_at": "TEXT",
+        "embedding_model": "TEXT NOT NULL DEFAULT ''",
+        "embedding_attempted_at": "TEXT",
     }
     for name, definition in additions.items():
         if name not in columns:
@@ -551,6 +606,10 @@ def _migrate(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_pinned ON messages(is_pinned)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vision_refresh "
+        "ON messages(media_type, vision_model, vision_prompt_version)"
     )
     connection.commit()
 
@@ -603,7 +662,7 @@ def embed(config: Settings, text: str) -> list[float]:
     return data["embeddings"][0]
 
 
-def image_for_vision(path: str, max_edge: int = 896) -> str:
+def image_for_vision(path: str, max_edge: int = 768) -> str:
     with Image.open(path) as source:
         source.seek(0)
         image = ImageOps.exif_transpose(source).convert("RGB")
@@ -625,18 +684,26 @@ def describe(config: Settings, path: str) -> str:
         {
             "model": config.vision_model,
             "stream": False,
-            "keep_alive": "10m",
+            "keep_alive": "5m",
             "options": {
-                "temperature": 0.1,
-                "num_predict": 96,
+                "temperature": 0,
+                "num_predict": 240,
             },
             "messages": [
                 {
                     "role": "user",
                     "content": (
-                        "Describe this image in detail for search. Include any "
-                        "visible words, the meme joke, objects, and "
-                        "recognizable public people."
+                        "Index this image for a private visual search library. "
+                        "Return concise plain text using exactly these labels: "
+                        "Summary, People, Visible text, Objects, Setting, "
+                        "Meme context, Search terms. Read all useful text. "
+                        "Name recognizable public figures when confident, "
+                        "using their full canonical names and common aliases. "
+                        "For a meme, identify its subjects, template and joke. "
+                        "Search terms must include concrete names, entities, "
+                        "actions, visual traits, topics and likely user query "
+                        "phrases. Use Unknown rather than inventing identity. "
+                        "Stay below 180 words and do not include a preamble."
                     ),
                     "images": [image],
                 }
@@ -646,13 +713,13 @@ def describe(config: Settings, path: str) -> str:
     )
     message = data.get("message", {})
     content = message.get("content", "").strip()
-    if content:
-        return content
-    return re.sub(
-        r"</?think>",
-        "",
-        message.get("thinking", ""),
-    ).strip()
+    if not content:
+        content = re.sub(
+            r"</?think>",
+            "",
+            message.get("thinking", ""),
+        ).strip()
+    return re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", content).strip()
 
 
 def media_kind(path: str | None, mime: str | None) -> str | None:
@@ -1119,6 +1186,8 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         SELECT media_path, urls_json, vision_text, extracted_text,
                link_metadata_json, content_status, content_error,
                enrichment_version, enriched_at, embedding_json,
+               embedding_model, embedding_attempted_at,
+               vision_model, vision_prompt_version, vision_attempted_at,
                media_sha256, visual_hash, media_aspect,
                duplicate_of_id, duplicate_reason, duplicate_distance,
                fingerprint_version
@@ -1142,6 +1211,11 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
             "enrichment_version",
             "enriched_at",
             "embedding_json",
+            "embedding_model",
+            "embedding_attempted_at",
+            "vision_model",
+            "vision_prompt_version",
+            "vision_attempted_at",
             "media_sha256",
             "visual_hash",
             "media_aspect",
@@ -1162,6 +1236,12 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         enriched["enrichment_version"] = 0
         enriched["enriched_at"] = None
         enriched["embedding_json"] = None
+        enriched["embedding_model"] = ""
+        enriched["embedding_attempted_at"] = None
+        enriched["vision_text"] = ""
+        enriched["vision_model"] = ""
+        enriched["vision_prompt_version"] = 0
+        enriched["vision_attempted_at"] = None
         enriched.setdefault("media_sha256", None)
         enriched.setdefault("visual_hash", None)
         enriched.setdefault("media_aspect", None)
@@ -1171,6 +1251,11 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         enriched.setdefault("fingerprint_version", 0)
 
     enriched.setdefault("vision_text", "")
+    enriched.setdefault("vision_model", "")
+    enriched.setdefault("vision_prompt_version", 0)
+    enriched.setdefault("vision_attempted_at", None)
+    enriched.setdefault("embedding_model", "")
+    enriched.setdefault("embedding_attempted_at", None)
     enriched.setdefault("extracted_text", "")
     enriched.setdefault("link_metadata_json", "[]")
     enriched.setdefault("content_status", "pending")
@@ -1197,8 +1282,13 @@ def upsert(connection: sqlite3.Connection, record: dict) -> None:
         "mime_type",
         "urls_json",
         "vision_text",
+        "vision_model",
+        "vision_prompt_version",
+        "vision_attempted_at",
         "indexed_text",
         "embedding_json",
+        "embedding_model",
+        "embedding_attempted_at",
         "extracted_text",
         "link_metadata_json",
         "content_status",
@@ -1429,25 +1519,10 @@ def cosine(left: list[float], right: list[float]) -> float:
 
 def _fts_query(query: str) -> str:
     tokens = re.findall(r"[\w+#.-]+", query.lower(), re.UNICODE)
-    stopwords = {
-        "a",
-        "an",
-        "and",
-        "for",
-        "from",
-        "in",
-        "is",
-        "of",
-        "on",
-        "or",
-        "the",
-        "to",
-        "with",
-    }
     clean = [
         token.replace('"', "")
         for token in tokens
-        if len(token.strip(".-")) >= 2 and token not in stopwords
+        if len(token.strip(".-")) >= 2 and token not in SEARCH_STOPWORDS
     ]
     return " AND ".join(f'"{token}"*' for token in clean[:12])
 
@@ -1499,7 +1574,40 @@ def _query_terms(query: str) -> list[str]:
         token.lower()
         for token in re.findall(r"[\w+#.-]+", query, re.UNICODE)
         if len(token.strip(".-")) >= 2
+        and token.lower() not in SEARCH_STOPWORDS
     ][:12]
+
+
+def _person_query_terms(query: str) -> list[str]:
+    terms = [
+        term
+        for term in _query_terms(query)
+        if term not in PERSON_QUERY_GENERIC and term.isalpha()
+    ]
+    return terms if 2 <= len(terms) <= 3 else []
+
+
+def _matches_people_field(vision_text: str | None, terms: list[str]) -> bool:
+    if not terms:
+        return True
+    match = re.search(
+        r"(?im)^people\s*:\s*(.+)$",
+        vision_text or "",
+    )
+    if not match or match.group(1).strip().lower() in {"", "none", "unknown"}:
+        return False
+    people_terms = _query_terms(match.group(1))
+
+    def close(left: str, right: str) -> bool:
+        return left == right or (
+            min(len(left), len(right)) >= 4
+            and SequenceMatcher(None, left, right).ratio() >= 0.84
+        )
+
+    return all(
+        any(close(term, person_term) for person_term in people_terms)
+        for term in terms
+    )
 
 
 def _match_reasons(parts: list[dict], query: str) -> list[str]:
@@ -1510,8 +1618,18 @@ def _match_reasons(parts: list[dict], query: str) -> list[str]:
     reasons = []
 
     def matched(value: str | None) -> bool:
-        lowered = (value or "").lower()
-        return bool(lowered) and any(term in lowered for term in terms)
+        value_terms = {
+            token.lower()
+            for token in re.findall(r"[\w+#.-]+", value or "", re.UNICODE)
+        }
+        return bool(value_terms) and any(
+            term in value_terms
+            or (
+                len(term) >= 4
+                and any(token.startswith(term) for token in value_terms)
+            )
+            for term in terms
+        )
 
     if any(matched(part.get("text")) for part in parts):
         reasons.append("Matched the original Telegram text")
@@ -1895,14 +2013,16 @@ def search(
     if config.enable_embeddings:
         try:
             query_vector = embed(config, query)
+            person_query_terms = _person_query_terms(query)
             semantic_clauses = [
                 "m.embedding_json IS NOT NULL",
+                "m.embedding_model = ?",
                 *clauses,
             ]
             semantic_where = "WHERE " + " AND ".join(semantic_clauses)
             semantic_rows = connection.execute(
                 f"{select} {semantic_where}",
-                filter_params,
+                [config.embed_model, *filter_params],
             ).fetchall()
             for row in semantic_rows:
                 item = dict(row)
@@ -1910,6 +2030,18 @@ def search(
                     query_vector,
                     json.loads(item["embedding_json"]),
                 )
+                if score < SEMANTIC_MIN_SCORE:
+                    continue
+                if (
+                    item["id"] not in found
+                    and item.get("media_type") == "image"
+                    and person_query_terms
+                    and not _matches_people_field(
+                        item.get("vision_text"),
+                        person_query_terms,
+                    )
+                ):
+                    continue
                 if item["id"] in found:
                     found[item["id"]]["_semantic_score"] = max(
                         found[item["id"]]["_semantic_score"],

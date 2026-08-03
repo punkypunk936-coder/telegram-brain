@@ -50,6 +50,9 @@ def update_counts(connection, config) -> None:
         pending_count(
             connection,
             require_vision=config.enable_vision,
+            vision_model=config.vision_model,
+            require_embeddings=config.enable_embeddings,
+            embed_model=config.embed_model,
         ),
     )
     set_runtime_state(
@@ -95,6 +98,9 @@ def process_batch(
             connection,
             batch_size,
             require_vision=config.enable_vision,
+            vision_model=config.vision_model,
+            require_embeddings=config.enable_embeddings,
+            embed_model=config.embed_model,
         ),
     )
     if rows:
@@ -146,6 +152,9 @@ def process_batch(
         if pending_count(
             connection,
             require_vision=config.enable_vision,
+            vision_model=config.vision_model,
+            require_embeddings=config.enable_embeddings,
+            embed_model=config.embed_model,
         ) == 0:
             database_retry(
                 connection,

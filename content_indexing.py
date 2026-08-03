@@ -21,6 +21,7 @@ from tgbrain import (
     ENRICHMENT_VERSION,
     METADATA_VERSION,
     Settings,
+    VISION_PROMPT_VERSION,
     build_indexed_text,
     describe,
     embed,
@@ -100,12 +101,17 @@ class MetadataParser(HTMLParser):
 class EnrichmentResult:
     row_id: int
     vision_text: str
+    vision_model: str
+    vision_prompt_version: int
+    vision_attempted_at: str | None
     extracted_text: str
     link_metadata_json: str
     content_status: str
     content_error: str
     indexed_text: str
     embedding_json: str | None
+    embedding_model: str
+    embedding_attempted_at: str | None
     category: str
     is_sensitive: int
     sensitive_reason: str | None
@@ -117,8 +123,13 @@ def _clean_text(value: str) -> str:
 
 
 def _valid_vision_description(value: str) -> bool:
-    words = re.findall(r"[A-Za-z][A-Za-z0-9'-]+", value)
-    return len(value.strip()) >= 30 and len(words) >= 5
+    words = re.findall(r"[^\W_][\w'-]+", value, re.UNICODE)
+    lowered = value.lower()
+    return (
+        len(value.strip()) >= 45
+        and len(words) >= 8
+        and not lowered.startswith(("got it", "let's break", "we need"))
+    )
 
 
 def ensure_vision_binary() -> Path:
@@ -484,6 +495,9 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
     expected = 0
     extracted_text = ""
     vision_text = row.get("vision_text") or ""
+    vision_model = row.get("vision_model") or ""
+    vision_prompt_version = int(row.get("vision_prompt_version") or 0)
+    vision_attempted_at = row.get("vision_attempted_at")
     media_path = row.get("media_path")
     if media_path:
         expected += 1
@@ -494,6 +508,7 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
             errors.append(f"Media: {error}")
         if row.get("media_type") == "image" and config.enable_vision:
             expected += 1
+            vision_attempted_at = datetime.now(timezone.utc).isoformat()
             try:
                 candidate_vision_text = describe(config, media_path)
                 if not _valid_vision_description(candidate_vision_text):
@@ -501,6 +516,8 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
                         "The vision model returned no useful description"
                     )
                 vision_text = candidate_vision_text
+                vision_model = config.vision_model
+                vision_prompt_version = VISION_PROMPT_VERSION
                 successes += 1
             except Exception as error:
                 errors.append(f"Image understanding: {error}")
@@ -553,11 +570,15 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
     updated["indexed_text"] = build_indexed_text(updated)
     metadata = message_metadata(updated)
     embedding_json = row.get("embedding_json")
+    embedding_model = row.get("embedding_model") or ""
+    embedding_attempted_at = row.get("embedding_attempted_at")
     if config.enable_embeddings and updated["indexed_text"]:
+        embedding_attempted_at = datetime.now(timezone.utc).isoformat()
         try:
             embedding_json = json.dumps(
                 embed(config, updated["indexed_text"])
             )
+            embedding_model = config.embed_model
         except Exception as error:
             errors.append(f"Embedding: {error}")
             if status == "ready":
@@ -566,12 +587,17 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
     return EnrichmentResult(
         row_id=int(row["id"]),
         vision_text=vision_text,
+        vision_model=vision_model,
+        vision_prompt_version=vision_prompt_version,
+        vision_attempted_at=vision_attempted_at,
         extracted_text=extracted_text,
         link_metadata_json=json.dumps(link_metadata),
         content_status=status,
         content_error=" · ".join(errors)[:2000],
         indexed_text=updated["indexed_text"],
         embedding_json=embedding_json,
+        embedding_model=embedding_model,
+        embedding_attempted_at=embedding_attempted_at,
         category=metadata["category"],
         is_sensitive=metadata["is_sensitive"],
         sensitive_reason=metadata["sensitive_reason"],
@@ -582,16 +608,21 @@ def apply_enrichment(connection, result: EnrichmentResult) -> None:
     connection.execute(
         """
         UPDATE messages
-        SET vision_text = ?, extracted_text = ?, link_metadata_json = ?,
+        SET vision_text = ?, vision_model = ?, vision_prompt_version = ?,
+            vision_attempted_at = ?, extracted_text = ?, link_metadata_json = ?,
             content_status = ?, content_error = ?,
             enrichment_version = ?, enriched_at = ?,
-            indexed_text = ?, embedding_json = ?,
+            indexed_text = ?, embedding_json = ?, embedding_model = ?,
+            embedding_attempted_at = ?,
             category = ?, is_sensitive = ?, sensitive_reason = ?,
             metadata_version = ?
         WHERE id = ?
         """,
         (
             result.vision_text,
+            result.vision_model,
+            result.vision_prompt_version,
+            result.vision_attempted_at,
             result.extracted_text,
             result.link_metadata_json,
             result.content_status,
@@ -600,6 +631,8 @@ def apply_enrichment(connection, result: EnrichmentResult) -> None:
             datetime.now(timezone.utc).isoformat(),
             result.indexed_text,
             result.embedding_json,
+            result.embedding_model,
+            result.embedding_attempted_at,
             result.category,
             result.is_sensitive,
             result.sensitive_reason,
@@ -614,18 +647,43 @@ def pending_count(
     connection,
     *,
     require_vision: bool = False,
+    vision_model: str = "",
+    require_embeddings: bool = False,
+    embed_model: str = "",
 ) -> int:
     missing_vision = (
         """
         OR (
             media_type = 'image'
             AND media_path IS NOT NULL
-            AND TRIM(vision_text) = ''
+            AND (
+                TRIM(vision_text) = ''
+                OR COALESCE(vision_model, '') != ?
+                OR vision_prompt_version < ?
+            )
         )
         """
         if require_vision
         else ""
     )
+    missing_embedding = (
+        """
+        OR (
+            TRIM(indexed_text) != ''
+            AND (
+                embedding_json IS NULL
+                OR COALESCE(embedding_model, '') != ?
+            )
+        )
+        """
+        if require_embeddings
+        else ""
+    )
+    params: list = [ENRICHMENT_VERSION]
+    if require_vision:
+        params.extend([vision_model, VISION_PROMPT_VERSION])
+    if require_embeddings:
+        params.append(embed_model)
     return int(
         connection.execute(
             f"""
@@ -636,9 +694,10 @@ def pending_count(
                   enrichment_version < ?
                   OR content_status IN ('pending', 'processing')
                   {missing_vision}
+                  {missing_embedding}
               )
             """,
-            (ENRICHMENT_VERSION,),
+            params,
         ).fetchone()[0]
     )
 
@@ -648,22 +707,52 @@ def next_pending(
     limit: int = 12,
     *,
     require_vision: bool = False,
+    vision_model: str = "",
+    require_embeddings: bool = False,
+    embed_model: str = "",
 ) -> list[dict]:
     missing_vision = (
         """
         OR (
             media_type = 'image'
             AND media_path IS NOT NULL
-            AND TRIM(vision_text) = ''
             AND (
-                enriched_at IS NULL
-                OR datetime(enriched_at) <= datetime('now', '-15 minutes')
+                TRIM(vision_text) = ''
+                OR COALESCE(vision_model, '') != ?
+                OR vision_prompt_version < ?
+            )
+            AND (
+                vision_attempted_at IS NULL
+                OR datetime(vision_attempted_at) <= datetime('now', '-6 hours')
             )
         )
         """
         if require_vision
         else ""
     )
+    missing_embedding = (
+        """
+        OR (
+            TRIM(indexed_text) != ''
+            AND (
+                embedding_json IS NULL
+                OR COALESCE(embedding_model, '') != ?
+            )
+            AND (
+                embedding_attempted_at IS NULL
+                OR datetime(embedding_attempted_at)
+                    <= datetime('now', '-6 hours')
+            )
+        )
+        """
+        if require_embeddings
+        else ""
+    )
+    params: list = [ENRICHMENT_VERSION]
+    if require_vision:
+        params.extend([vision_model, VISION_PROMPT_VERSION])
+    if require_embeddings:
+        params.append(embed_model)
     rows = connection.execute(
         f"""
         SELECT *
@@ -673,19 +762,34 @@ def next_pending(
               enrichment_version < ?
               OR content_status IN ('pending', 'processing')
               {missing_vision}
+              {missing_embedding}
           )
         ORDER BY
             CASE
-                WHEN media_type = 'image' THEN 0
-                WHEN media_type IN ('pdf', 'document', 'audio') THEN 1
-                WHEN urls_json != '[]' THEN 2
-                ELSE 3
+                WHEN media_type = 'image'
+                 AND datetime(date_utc) >= datetime('now', '-30 days')
+                    THEN 0
+                WHEN media_type = 'image'
+                 AND (
+                    LOWER(vision_text) LIKE '%person%'
+                    OR LOWER(vision_text) LIKE '%people%'
+                    OR LOWER(vision_text) LIKE '% man %'
+                    OR LOWER(vision_text) LIKE '%woman%'
+                    OR LOWER(vision_text) LIKE '%girl%'
+                    OR LOWER(vision_text) LIKE '%boy%'
+                    OR LOWER(vision_text) LIKE '%president%'
+                    OR LOWER(vision_text) LIKE '%leader%'
+                 ) THEN 1
+                WHEN media_type = 'image' THEN 2
+                WHEN media_type IN ('pdf', 'document', 'audio') THEN 3
+                WHEN urls_json != '[]' THEN 4
+                ELSE 5
             END,
             date_utc DESC,
             message_id DESC
         LIMIT ?
         """,
-        (ENRICHMENT_VERSION, limit),
+        [*params, limit],
     ).fetchall()
     if rows:
         connection.executemany(
