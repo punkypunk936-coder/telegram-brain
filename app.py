@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import io
 import json
 import math
 import re
@@ -9,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import streamlit as st
+from PIL import Image, ImageOps
 
 from clipboard_utils import ClipboardError, copy_links, copy_media, copy_text
 from service_control import (
@@ -36,7 +38,7 @@ st.set_page_config(
     page_title="Telegram Brain",
     page_icon=":material/library_books:",
     layout="wide",
-    initial_sidebar_state="auto",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown(
@@ -49,9 +51,9 @@ st.markdown(
         }
 
         .block-container {
-            max-width: 1180px;
-            padding-top: 3.4rem;
-            padding-bottom: 5rem;
+            max-width: 1480px;
+            padding-top: 2.2rem;
+            padding-bottom: 4rem;
         }
 
         [data-testid="stSidebar"] {
@@ -68,7 +70,7 @@ st.markdown(
 
         .app-title {
             color: inherit;
-            font-size: 1.72rem;
+            font-size: 1.55rem;
             font-weight: 720;
             line-height: 1.15;
             margin: 0;
@@ -77,7 +79,7 @@ st.markdown(
         .app-subtitle {
             color: inherit;
             font-size: 0.94rem;
-            margin: 0.25rem 0 0.8rem;
+            margin: 0.2rem 0 0.55rem;
             opacity: 0.68;
         }
 
@@ -138,8 +140,8 @@ st.markdown(
             display: flex;
             flex-wrap: wrap;
             gap: 0.55rem 1.1rem;
-            margin: 0.15rem 0 1rem;
-            padding: 0 0 0.75rem;
+            margin: 0.1rem 0 0.75rem;
+            padding: 0 0 0.6rem;
         }
 
         .status-item {
@@ -257,6 +259,84 @@ st.markdown(
             margin: 0.8rem 0 0.2rem;
         }
 
+        .library-heading {
+            align-items: baseline;
+            display: flex;
+            gap: 0.7rem;
+            margin: 0.9rem 0 0.55rem;
+        }
+
+        .library-heading strong {
+            font-size: 1.02rem;
+            font-weight: 700;
+        }
+
+        .library-heading span {
+            font-size: 0.78rem;
+            opacity: 0.58;
+        }
+
+        .detail-kicker {
+            font-size: 0.72rem;
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+            opacity: 0.58;
+            text-transform: uppercase;
+        }
+
+        .detail-copy {
+            font-size: 0.92rem;
+            line-height: 1.52;
+            margin: 0.45rem 0 0.8rem;
+            opacity: 0.84;
+            overflow-wrap: anywhere;
+        }
+
+        .asset-file {
+            border-bottom: 1px solid var(--brain-line);
+            padding: 0.65rem 0 0.75rem;
+        }
+
+        .asset-file-title {
+            font-size: 0.94rem;
+            font-weight: 650;
+            line-height: 1.35;
+            overflow-wrap: anywhere;
+        }
+
+        .asset-file-meta {
+            font-size: 0.76rem;
+            margin-top: 0.18rem;
+            opacity: 0.58;
+        }
+
+        div[data-testid="stImage"] img {
+            border-radius: 2px;
+        }
+
+        div[data-testid="stImage"] {
+            margin-bottom: -0.55rem;
+        }
+
+        div[data-testid="stHorizontalBlock"] {
+            gap: 0.48rem;
+        }
+
+        [data-testid="stSegmentedControl"] {
+            margin-bottom: 0.2rem;
+        }
+
+        [data-testid="stSegmentedControl"] button {
+            min-height: 2.35rem;
+        }
+
+        [class*="st-key-grid-copy-"] button,
+        [class*="st-key-grid-open-"] button {
+            min-height: 2rem;
+            padding-bottom: 0.2rem;
+            padding-top: 0.2rem;
+        }
+
         div[data-testid="stVerticalBlockBorderWrapper"] {
             border-radius: 6px;
             border-color: var(--brain-line);
@@ -284,13 +364,33 @@ st.markdown(
 
         @media (max-width: 720px) {
             .block-container {
-                padding-top: 3.75rem;
-                padding-left: 0.9rem;
-                padding-right: 0.9rem;
+                padding-top: 1.1rem;
+                padding-left: 0.75rem;
+                padding-right: 0.75rem;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> div:nth-child(6)) {
+                flex-wrap: wrap;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> div:nth-child(6)) > div {
+                flex: 1 1 calc(33.333% - 0.5rem) !important;
+                min-width: calc(33.333% - 0.5rem) !important;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> div:nth-child(6))
+            [data-testid="stHorizontalBlock"] {
+                flex-wrap: nowrap;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> div:nth-child(6))
+            [data-testid="stHorizontalBlock"] > div {
+                flex: 1 1 50% !important;
+                min-width: 0 !important;
             }
 
             .app-title {
-                font-size: 1.45rem;
+                font-size: 1.3rem;
             }
 
             .status-strip {
@@ -334,6 +434,7 @@ CONTENT_TYPES = {
 
 def reset_page() -> None:
     st.session_state.page = 1
+    st.session_state.selected_library_item = None
 
 
 def open_bucket(category: str) -> None:
@@ -694,6 +795,486 @@ def service_age(timestamp: str | None) -> str:
     return f"{seconds // 3600}h ago"
 
 
+LIBRARY_VIEWS = ("Media", "Files", "Links", "Voice", "GIFs")
+GALLERY_PAGE_SIZE = 36
+LIST_PAGE_SIZE = 18
+
+
+def _is_gif_item(item: dict) -> bool:
+    path = Path(str(item.get("path") or item.get("media_path") or ""))
+    mime = str(item.get("mime_type") or "").lower()
+    media_type = str(item.get("media_type") or "").lower()
+    return media_type == "video" or mime == "image/gif" or path.suffix.lower() == ".gif"
+
+
+def row_matches_view(row: dict, view: str) -> bool:
+    media_items = row.get("media_items") or []
+    if not media_items and row.get("media_path"):
+        media_items = [row]
+    if view == "Media":
+        return any(
+            str(item.get("media_type") or "").lower() == "image"
+            and not _is_gif_item(item)
+            for item in media_items
+        )
+    if view == "GIFs":
+        return any(_is_gif_item(item) for item in media_items)
+    if view == "Files":
+        return any(
+            str(item.get("media_type") or "").lower() in {"pdf", "document"}
+            for item in media_items
+        )
+    if view == "Voice":
+        return any(
+            str(item.get("media_type") or "").lower() == "audio"
+            for item in media_items
+        )
+    if view == "Links":
+        return bool(parse_urls(row))
+    return True
+
+
+def _view_sql(view: str) -> str:
+    if view == "Media":
+        return """
+            m.media_type = 'image'
+            AND LOWER(COALESCE(m.file_name, '')) NOT LIKE '%.gif'
+            AND LOWER(COALESCE(m.mime_type, '')) != 'image/gif'
+        """
+    if view == "GIFs":
+        return """
+            (m.media_type = 'video'
+             OR LOWER(COALESCE(m.file_name, '')) LIKE '%.gif'
+             OR LOWER(COALESCE(m.mime_type, '')) = 'image/gif')
+        """
+    if view == "Files":
+        return "m.media_type IN ('pdf', 'document')"
+    if view == "Voice":
+        return "m.media_type = 'audio'"
+    return "COALESCE(m.urls_json, '[]') != '[]'"
+
+
+def browse_library(
+    connection,
+    *,
+    view: str,
+    scope: str,
+    topic: str,
+    limit: int,
+    offset: int,
+) -> tuple[list[dict], int]:
+    clauses = [
+        "m.is_sensitive = 0",
+        "m.duplicate_of_id IS NULL",
+        _view_sql(view),
+    ]
+    params: list[object] = []
+    if scope == "Pinned":
+        clauses.append("m.is_pinned = 1")
+    elif scope == "Saved":
+        clauses.append("COALESCE(s.starred, 0) = 1")
+    if topic and topic != "All topics":
+        clauses.append("COALESCE(s.user_category, m.category) = ?")
+        params.append(topic)
+    where = " AND ".join(f"({clause.strip()})" for clause in clauses)
+    total = connection.execute(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM messages m
+        LEFT JOIN item_state s ON s.message_row_id = m.id
+        WHERE {where}
+        """,
+        params,
+    ).fetchone()["n"]
+    rows = connection.execute(
+        f"""
+        SELECT m.*, COALESCE(s.starred, 0) AS starred,
+               COALESCE(s.note, '') AS note, s.user_category,
+               COALESCE(s.user_category, m.category) AS display_category
+        FROM messages m
+        LEFT JOIN item_state s ON s.message_row_id = m.id
+        WHERE {where}
+        ORDER BY m.date_utc DESC, m.message_id DESC
+        LIMIT ? OFFSET ?
+        """,
+        [*params, limit, offset],
+    ).fetchall()
+    return [dict(row) for row in rows], int(total or 0)
+
+
+def search_library(
+    connection,
+    config,
+    *,
+    query: str,
+    view: str,
+    scope: str,
+    topic: str,
+) -> list[dict]:
+    kind = {
+        "Media": "image",
+        "GIFs": "video",
+        "Voice": "audio",
+    }.get(view, "all")
+    rows = search(
+        connection,
+        config,
+        query,
+        kind,
+        400,
+        include_sensitive=False,
+        category=topic,
+        starred_only=scope == "Saved",
+        pinned_only=scope == "Pinned",
+    )
+    return [row for row in rows if row_matches_view(row, view)]
+
+
+@st.cache_data(show_spinner=False, max_entries=768)
+def gallery_thumbnail(path_string: str, modified_ns: int, edge: int = 360) -> bytes | None:
+    del modified_ns
+    try:
+        with Image.open(path_string) as source:
+            source.seek(0)
+            source.draft("RGB", (edge, edge))
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            square = ImageOps.fit(
+                image,
+                (edge, edge),
+                method=Image.Resampling.BILINEAR,
+                centering=(0.5, 0.5),
+            )
+            output = io.BytesIO()
+            square.save(output, format="JPEG", quality=80)
+            return output.getvalue()
+    except (OSError, ValueError):
+        return None
+
+
+def load_library_row(connection, row_id: int | None) -> dict | None:
+    if not row_id:
+        return None
+    row = connection.execute(
+        """
+        SELECT m.*, COALESCE(s.starred, 0) AS starred,
+               COALESCE(s.note, '') AS note, s.user_category,
+               COALESCE(s.user_category, m.category) AS display_category
+        FROM messages m
+        LEFT JOIN item_state s ON s.message_row_id = m.id
+        WHERE m.id = ? AND m.is_sensitive = 0
+        """,
+        (row_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def select_library_item(row_id: int) -> None:
+    st.session_state.selected_library_item = row_id
+
+
+def clear_library_item() -> None:
+    st.session_state.selected_library_item = None
+
+
+def _copy_one_media(row: dict) -> None:
+    items = existing_media_items(row)
+    if not items:
+        st.toast("The original media file is unavailable.", icon=":material/error:")
+        return
+    try:
+        copied = copy_media(item["_path"] for item in items)
+        st.toast(
+            "Media copied." if copied == 1 else f"{copied} media assets copied.",
+            icon=":material/check_circle:",
+        )
+    except ClipboardError as error:
+        clipboard_error(error)
+
+
+def render_library_pagination(total: int, page_size: int, key_prefix: str) -> None:
+    total_pages = max(1, math.ceil(total / page_size))
+    st.session_state.page = min(max(1, st.session_state.page), total_pages)
+    if total_pages <= 1:
+        return
+    left, middle, right = st.columns([1, 3, 1], vertical_alignment="center")
+    with left:
+        if st.button(
+            "",
+            icon=":material/arrow_back:",
+            help="Previous page",
+            disabled=st.session_state.page <= 1,
+            key=f"{key_prefix}-previous",
+            width="stretch",
+        ):
+            st.session_state.page -= 1
+            clear_library_item()
+            st.rerun()
+    with middle:
+        st.caption(f"{st.session_state.page} / {total_pages}")
+    with right:
+        if st.button(
+            "",
+            icon=":material/arrow_forward:",
+            help="Next page",
+            disabled=st.session_state.page >= total_pages,
+            key=f"{key_prefix}-next",
+            width="stretch",
+        ):
+            st.session_state.page += 1
+            clear_library_item()
+            st.rerun()
+
+
+def render_selected_item(connection, row: dict) -> None:
+    title = result_title(row)
+    text = mask_sensitive_text(
+        row.get("text") or row.get("extracted_text") or ""
+    ).strip()
+    vision = mask_sensitive_text(row.get("vision_text") or "").strip()
+    media_items = existing_media_items(row)
+    with st.container(border=True):
+        close_col, title_col = st.columns([1, 14], vertical_alignment="center")
+        with close_col:
+            st.button(
+                "",
+                icon=":material/close:",
+                help="Close preview",
+                on_click=clear_library_item,
+                key=f"detail-close-{row['id']}",
+            )
+        with title_col:
+            st.markdown(
+                '<div class="detail-kicker">Selected item</div>'
+                f'<div class="result-title">{html.escape(title)}</div>',
+                unsafe_allow_html=True,
+            )
+        visual, details = st.columns([1.15, 1.85], vertical_alignment="top")
+        with visual:
+            if media_items:
+                first = media_items[0]
+                if first.get("media_type") == "image":
+                    st.image(str(first["_path"]), width="stretch")
+                elif first.get("media_type") == "video":
+                    st.video(str(first["_path"]), autoplay=False, loop=True)
+                elif first.get("media_type") == "audio":
+                    st.audio(str(first["_path"]), autoplay=False)
+                else:
+                    st.markdown(
+                        '<div class="asset-file-title">'
+                        + html.escape(first.get("file_name") or first["_path"].name)
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+        with details:
+            if row.get("is_pinned"):
+                st.badge("Pinned", color="orange")
+            st.badge(row.get("display_category") or "Uncategorised", color="gray")
+            if text:
+                st.markdown(
+                    '<div class="detail-copy">'
+                    + html.escape(clean_preview(text, 900))
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+            elif vision:
+                st.markdown(
+                    '<div class="detail-copy">'
+                    + html.escape(visual_preview(vision))
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+            actions = st.columns(3)
+            with actions[0]:
+                if st.button(
+                    "Copy",
+                    icon=":material/content_copy:",
+                    key=f"detail-copy-{row['id']}",
+                    width="stretch",
+                ):
+                    if media_items:
+                        _copy_one_media(row)
+                    else:
+                        copyable, _ = result_copy_text(row)
+                        try:
+                            copy_text(copyable)
+                            st.toast("Copied.", icon=":material/check_circle:")
+                        except ClipboardError as error:
+                            clipboard_error(error)
+            with actions[1]:
+                if st.button(
+                    "Saved" if row.get("starred") else "Save",
+                    icon=(
+                        ":material/star:"
+                        if row.get("starred")
+                        else ":material/star_outline:"
+                    ),
+                    key=f"detail-save-{row['id']}",
+                    width="stretch",
+                ):
+                    set_item_state(
+                        connection,
+                        row["id"],
+                        starred=not bool(row.get("starred")),
+                    )
+                    st.rerun()
+            with actions[2]:
+                urls = parse_urls(row)
+                if urls:
+                    st.link_button(
+                        "Open link",
+                        urls[0],
+                        icon=":material/open_in_new:",
+                        width="stretch",
+                    )
+        render_link_actions(row, f"detail-{row['id']}")
+        if vision or row.get("extracted_text"):
+            with st.expander("Indexed context"):
+                if vision:
+                    st.markdown("**Image understanding**")
+                    st.write(clean_preview(vision, 1400))
+                if row.get("extracted_text"):
+                    st.markdown("**Extracted content**")
+                    st.write(
+                        clean_preview(
+                            mask_sensitive_text(row["extracted_text"]),
+                            1400,
+                        )
+                    )
+
+
+def render_media_grid(rows: list[dict], view: str) -> None:
+    assets: list[tuple[dict, dict]] = []
+    for row in rows:
+        for item in existing_media_items(row):
+            if view == "Media" and item.get("media_type") == "image" and not _is_gif_item(item):
+                assets.append((row, item))
+            elif view == "GIFs" and _is_gif_item(item):
+                assets.append((row, item))
+    column_count = 6 if view == "Media" else 3
+    for row_start in range(0, len(assets), column_count):
+        asset_row = assets[row_start : row_start + column_count]
+        columns = st.columns(column_count, gap="small")
+        for column, (row, item) in zip(columns, asset_row):
+            with column:
+                if view == "Media":
+                    path = item["_path"]
+                    thumbnail = gallery_thumbnail(
+                        str(path),
+                        path.stat().st_mtime_ns,
+                    )
+                    if thumbnail:
+                        st.image(thumbnail, width="stretch")
+                    else:
+                        st.image(str(path), width="stretch")
+                else:
+                    st.video(str(item["_path"]), autoplay=False, loop=True)
+                copy_col, open_col = st.columns(2, gap="small")
+                with copy_col:
+                    if st.button(
+                        "",
+                        icon=":material/content_copy:",
+                        help=f"Copy {view.lower()[:-1] if view.endswith('s') else view.lower()}",
+                        key=f"grid-copy-{view}-{row['id']}-{item['id']}",
+                        width="stretch",
+                    ):
+                        _copy_one_media({**row, "media_items": [item]})
+                with open_col:
+                    st.button(
+                        "",
+                        icon=":material/open_in_full:",
+                        help="Open details",
+                        key=f"grid-open-{view}-{row['id']}-{item['id']}",
+                        on_click=select_library_item,
+                        args=(item.get("id") or row["id"],),
+                        width="stretch",
+                    )
+
+
+def render_library_list(rows: list[dict], view: str) -> None:
+    for row in rows:
+        media_items = existing_media_items(row)
+        title = result_title(row)
+        text = mask_sensitive_text(row.get("text") or "").strip()
+        if view == "Links":
+            details = link_details(row)
+            if not details:
+                continue
+            item = details[0]
+            left, copy_col, open_col = st.columns([10, 1, 1], vertical_alignment="center")
+            with left:
+                st.markdown(
+                    '<div class="asset-file">'
+                    f'<div class="asset-file-title">{html.escape(item["title"])}</div>'
+                    f'<div class="asset-file-meta">{html.escape(item["host"])}</div>'
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+            with copy_col:
+                if st.button(
+                    "",
+                    icon=":material/content_copy:",
+                    help="Copy link",
+                    key=f"list-copy-link-{row['id']}",
+                    width="stretch",
+                ):
+                    try:
+                        copy_links([item["url"]])
+                        st.toast("Link copied.", icon=":material/check_circle:")
+                    except ClipboardError as error:
+                        clipboard_error(error)
+            with open_col:
+                st.link_button(
+                    "",
+                    item["url"],
+                    icon=":material/open_in_new:",
+                    help="Open link",
+                    width="stretch",
+                )
+            continue
+
+        left, copy_col, open_col = st.columns([10, 1, 1], vertical_alignment="center")
+        with left:
+            file_name = (
+                media_items[0].get("file_name")
+                if media_items
+                else row.get("file_name")
+            ) or title
+            meta = "Voice note" if view == "Voice" else (row.get("mime_type") or "File")
+            st.markdown(
+                '<div class="asset-file">'
+                f'<div class="asset-file-title">{html.escape(file_name)}</div>'
+                f'<div class="asset-file-meta">{html.escape(meta)}</div>'
+                + (
+                    f'<div class="asset-file-meta">{html.escape(clean_preview(text, 160))}</div>'
+                    if text
+                    else ""
+                )
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+            if view == "Voice" and media_items:
+                st.audio(str(media_items[0]["_path"]), autoplay=False)
+        with copy_col:
+            if st.button(
+                "",
+                icon=":material/content_copy:",
+                help="Copy file",
+                key=f"list-copy-{view}-{row['id']}",
+                width="stretch",
+            ):
+                _copy_one_media(row)
+        with open_col:
+            st.button(
+                "",
+                icon=":material/open_in_full:",
+                help="Open details",
+                key=f"list-open-{view}-{row['id']}",
+                on_click=select_library_item,
+                args=(row["id"],),
+                width="stretch",
+            )
+
+
 config = settings()
 connection = db(config.db_path)
 
@@ -894,14 +1475,8 @@ sync_online = (
 index_online = bool(index_snapshot["alive"])
 
 with st.sidebar:
-    st.markdown("### Refine")
-
-    content_label = st.selectbox(
-        "Content type",
-        list(CONTENT_TYPES),
-        key="content_filter",
-        on_change=reset_page,
-    )
+    st.markdown("### Filters")
+    content_label = "Everything"
     selected_topic = st.selectbox(
         "Topic",
         available_topics,
@@ -1042,6 +1617,132 @@ with st.sidebar:
             "Semantic search "
             + ("enabled." if config.enable_embeddings else "is optional.")
         )
+
+header_left, header_right = st.columns([12, 1], vertical_alignment="center")
+with header_left:
+    st.markdown(
+        '<div class="app-title">Telegram Brain</div>'
+        '<div class="app-subtitle">Your searchable Telegram library.</div>',
+        unsafe_allow_html=True,
+    )
+with header_right:
+    if st.button(
+        "",
+        icon=":material/refresh:",
+        width="content",
+        help="Refresh library",
+        key="library-refresh",
+    ):
+        st.rerun()
+
+st.markdown(
+    '<div class="status-strip">'
+    '<span class="status-item">'
+    f'<span class="status-dot{" online" if sync_online else ""}"></span>'
+    f'{"Live" if sync_online else "Sync paused"}'
+    "</span>"
+    f'<span class="status-item">{int(stats["total"] or 0):,} items</span>'
+    f'<span class="status-item">{pinned_count:,} pinned</span>'
+    f'<span class="status-item">{starred_count:,} saved</span>'
+    "</div>",
+    unsafe_allow_html=True,
+)
+
+q = st.text_input(
+    "Search",
+    placeholder="Describe the meme, image, file, link or voice note",
+    key="search_query",
+    label_visibility="collapsed",
+    on_change=reset_page,
+)
+
+view = st.segmented_control(
+    "Library type",
+    list(LIBRARY_VIEWS),
+    default="Media",
+    key="library_view",
+    on_change=reset_page,
+    label_visibility="collapsed",
+    width="stretch",
+)
+scope = st.segmented_control(
+    "Scope",
+    ["All", "Pinned", "Saved"],
+    key="scope_filter",
+    on_change=reset_page,
+    label_visibility="collapsed",
+    width="content",
+)
+view = view or "Media"
+scope = scope or "All"
+page_size = GALLERY_PAGE_SIZE if view == "Media" else LIST_PAGE_SIZE
+
+if q.strip():
+    matching_rows = search_library(
+        connection,
+        config,
+        query=q,
+        view=view,
+        scope=scope,
+        topic=selected_topic,
+    )
+    total_results = len(matching_rows)
+    start = (st.session_state.page - 1) * page_size
+    page_rows = matching_rows[start : start + page_size]
+else:
+    start = (st.session_state.page - 1) * page_size
+    page_rows, total_results = browse_library(
+        connection,
+        view=view,
+        scope=scope,
+        topic=selected_topic,
+        limit=page_size,
+        offset=start,
+    )
+
+selected_row = load_library_row(
+    connection,
+    st.session_state.get("selected_library_item"),
+)
+if selected_row:
+    render_selected_item(connection, selected_row)
+
+context_parts = []
+if scope != "All":
+    context_parts.append(scope.lower())
+if selected_topic != "All topics":
+    context_parts.append(selected_topic)
+if q.strip():
+    context_parts.append(f'for "{clean_preview(q, 42)}"')
+context = " · ".join(context_parts)
+st.markdown(
+    '<div class="library-heading">'
+    f'<strong>{html.escape(view)}</strong>'
+    f'<span>{total_results:,} {html.escape(context)}</span>'
+    "</div>",
+    unsafe_allow_html=True,
+)
+
+if not page_rows:
+    pending = int(stats["visual_pending"] or 0)
+    message = "Nothing matches this view yet."
+    if q.strip() and view == "Media" and pending:
+        message = f"No confident match yet. {pending:,} images are still being read in the background."
+    st.info(message, icon=":material/search:")
+elif view in {"Media", "GIFs"}:
+    render_media_grid(page_rows, view)
+else:
+    render_library_list(page_rows, view)
+
+render_library_pagination(total_results, page_size, f"library-{view.lower()}")
+
+warning, warning_at = get_runtime_state(connection, "last_search_warning")
+if warning and warning_at and row_datetime(warning_at) > datetime.now(timezone.utc) - timedelta(minutes=5):
+    st.caption("Search used a local fallback on the last query.")
+
+connection.close()
+st.stop()
+
 
 page_size = 20
 
