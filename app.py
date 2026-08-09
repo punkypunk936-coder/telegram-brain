@@ -214,12 +214,33 @@ st.markdown(
             margin: 0.35rem 0 0.2rem;
         }
 
+        .bucket-description {
+            font-size: 0.8rem;
+            line-height: 1.4;
+            min-height: 2.3rem;
+            opacity: 0.7;
+        }
+
         .bucket-latest {
             min-height: 2.7rem;
             font-size: 0.85rem;
             line-height: 1.35;
             margin: 0.4rem 0 0.65rem;
             overflow-wrap: anywhere;
+        }
+
+        .review-count {
+            color: var(--brain-amber);
+            font-size: 2rem;
+            font-weight: 720;
+            line-height: 1;
+            margin: 0.1rem 0 0.35rem;
+        }
+
+        .review-copy {
+            font-size: 0.9rem;
+            line-height: 1.5;
+            opacity: 0.78;
         }
 
         .action-label {
@@ -364,7 +385,7 @@ st.markdown(
 
         @media (max-width: 720px) {
             .block-container {
-                padding-top: 1.1rem;
+                padding-top: 3.7rem;
                 padding-left: 0.75rem;
                 padding-right: 0.75rem;
             }
@@ -425,11 +446,34 @@ ORGANISE_TOPICS = [
 CONTENT_TYPES = {
     "Everything": "all",
     "Text only": "text",
+    "Links": "all",
     "Images": "image",
     "Video": "video",
     "Audio": "audio",
     "PDFs": "pdf",
     "Documents": "document",
+}
+
+PRIMARY_TOPIC_ORDER = [
+    "Trading & Markets",
+    "Technology & AI",
+    "Work & Career",
+    "Writing",
+    "Research & Learning",
+    "Ideas & Building",
+    "Memes & Culture",
+    "Personal & Admin",
+]
+
+TOPIC_DESCRIPTIONS = {
+    "Trading & Markets": "Setups, theses, market notes and charts",
+    "Technology & AI": "Models, chips, tools and technical research",
+    "Work & Career": "Applications, professional notes and work history",
+    "Writing": "Drafts, passages and ideas worth developing",
+    "Research & Learning": "Reading notes, explainers and useful references",
+    "Ideas & Building": "Product ideas, experiments and things to make",
+    "Memes & Culture": "Memes, reactions and internet culture",
+    "Personal & Admin": "Personal reminders, plans and life admin",
 }
 
 def reset_page() -> None:
@@ -567,6 +611,12 @@ def process_scope(rows: list[dict], scope: str) -> list[dict]:
         return [row for row in rows if parse_urls(row)]
     if scope == "Media":
         return [row for row in rows if row.get("media_path")]
+    return rows
+
+
+def process_content_filter(rows: list[dict], label: str) -> list[dict]:
+    if label == "Links":
+        return [row for row in rows if parse_urls(row)]
     return rows
 
 
@@ -1282,6 +1332,12 @@ if "page" not in st.session_state:
     st.session_state.page = 1
 if "scope_filter" not in st.session_state:
     st.session_state.scope_filter = "All"
+if st.session_state.scope_filter not in {"All", "Pinned", "Saved"}:
+    st.session_state.scope_filter = "All"
+if "content_filter" not in st.session_state:
+    st.session_state.content_filter = "Everything"
+if st.session_state.content_filter not in CONTENT_TYPES:
+    st.session_state.content_filter = "Everything"
 
 reconcile_services(config)
 
@@ -1438,12 +1494,31 @@ bucket_rows = [
         """
     ).fetchall()
 ]
+bucket_by_category = {
+    row["display_category"]: row
+    for row in bucket_rows
+}
+topic_rows = [
+    bucket_by_category[category]
+    for category in PRIMARY_TOPIC_ORDER
+    if category in bucket_by_category
+]
+remaining_topic_names = [
+    row["display_category"]
+    for row in bucket_rows
+    if row["display_category"] not in PRIMARY_TOPIC_ORDER
+]
 available_topics = [
     "All topics",
-    *(row["display_category"] for row in bucket_rows),
+    *(row["display_category"] for row in topic_rows),
+    *remaining_topic_names,
 ]
 if st.session_state.get("topic_filter") not in available_topics:
     st.session_state.topic_filter = "All topics"
+
+review_count = int(
+    bucket_by_category.get("Uncategorised", {}).get("item_count", 0)
+)
 
 latest_results = search(
     connection,
@@ -1463,6 +1538,15 @@ pinned_results = search(
     include_sensitive=False,
     pinned_only=True,
 )
+review_results = search(
+    connection,
+    config,
+    "",
+    "all",
+    3,
+    include_sensitive=False,
+    category="Uncategorised",
+)
 pinned_count = int(stats["pinned"] or 0)
 
 sync_snapshot = watcher_snapshot(config)
@@ -1475,14 +1559,7 @@ sync_online = (
 index_online = bool(index_snapshot["alive"])
 
 with st.sidebar:
-    st.markdown("### Filters")
-    content_label = "Everything"
-    selected_topic = st.selectbox(
-        "Topic",
-        available_topics,
-        key="topic_filter",
-        on_change=reset_page,
-    )
+    st.markdown("### System")
 
     def sync_status_panel(snapshot: dict) -> None:
         if snapshot["alive"] and snapshot["status"] == "online":
@@ -1618,132 +1695,6 @@ with st.sidebar:
             + ("enabled." if config.enable_embeddings else "is optional.")
         )
 
-header_left, header_right = st.columns([12, 1], vertical_alignment="center")
-with header_left:
-    st.markdown(
-        '<div class="app-title">Telegram Brain</div>'
-        '<div class="app-subtitle">Your searchable Telegram library.</div>',
-        unsafe_allow_html=True,
-    )
-with header_right:
-    if st.button(
-        "",
-        icon=":material/refresh:",
-        width="content",
-        help="Refresh library",
-        key="library-refresh",
-    ):
-        st.rerun()
-
-st.markdown(
-    '<div class="status-strip">'
-    '<span class="status-item">'
-    f'<span class="status-dot{" online" if sync_online else ""}"></span>'
-    f'{"Live" if sync_online else "Sync paused"}'
-    "</span>"
-    f'<span class="status-item">{int(stats["total"] or 0):,} items</span>'
-    f'<span class="status-item">{pinned_count:,} pinned</span>'
-    f'<span class="status-item">{starred_count:,} saved</span>'
-    "</div>",
-    unsafe_allow_html=True,
-)
-
-q = st.text_input(
-    "Search",
-    placeholder="Describe the meme, image, file, link or voice note",
-    key="search_query",
-    label_visibility="collapsed",
-    on_change=reset_page,
-)
-
-view = st.segmented_control(
-    "Library type",
-    list(LIBRARY_VIEWS),
-    default="Media",
-    key="library_view",
-    on_change=reset_page,
-    label_visibility="collapsed",
-    width="stretch",
-)
-scope = st.segmented_control(
-    "Scope",
-    ["All", "Pinned", "Saved"],
-    key="scope_filter",
-    on_change=reset_page,
-    label_visibility="collapsed",
-    width="content",
-)
-view = view or "Media"
-scope = scope or "All"
-page_size = GALLERY_PAGE_SIZE if view == "Media" else LIST_PAGE_SIZE
-
-if q.strip():
-    matching_rows = search_library(
-        connection,
-        config,
-        query=q,
-        view=view,
-        scope=scope,
-        topic=selected_topic,
-    )
-    total_results = len(matching_rows)
-    start = (st.session_state.page - 1) * page_size
-    page_rows = matching_rows[start : start + page_size]
-else:
-    start = (st.session_state.page - 1) * page_size
-    page_rows, total_results = browse_library(
-        connection,
-        view=view,
-        scope=scope,
-        topic=selected_topic,
-        limit=page_size,
-        offset=start,
-    )
-
-selected_row = load_library_row(
-    connection,
-    st.session_state.get("selected_library_item"),
-)
-if selected_row:
-    render_selected_item(connection, selected_row)
-
-context_parts = []
-if scope != "All":
-    context_parts.append(scope.lower())
-if selected_topic != "All topics":
-    context_parts.append(selected_topic)
-if q.strip():
-    context_parts.append(f'for "{clean_preview(q, 42)}"')
-context = " · ".join(context_parts)
-st.markdown(
-    '<div class="library-heading">'
-    f'<strong>{html.escape(view)}</strong>'
-    f'<span>{total_results:,} {html.escape(context)}</span>'
-    "</div>",
-    unsafe_allow_html=True,
-)
-
-if not page_rows:
-    pending = int(stats["visual_pending"] or 0)
-    message = "Nothing matches this view yet."
-    if q.strip() and view == "Media" and pending:
-        message = f"No confident match yet. {pending:,} images are still being read in the background."
-    st.info(message, icon=":material/search:")
-elif view in {"Media", "GIFs"}:
-    render_media_grid(page_rows, view)
-else:
-    render_library_list(page_rows, view)
-
-render_library_pagination(total_results, page_size, f"library-{view.lower()}")
-
-warning, warning_at = get_runtime_state(connection, "last_search_warning")
-if warning and warning_at and row_datetime(warning_at) > datetime.now(timezone.utc) - timedelta(minutes=5):
-    st.caption("Search used a local fallback on the last query.")
-
-connection.close()
-st.stop()
-
-
 page_size = 20
 
 header_left, header_right = st.columns([10, 1], vertical_alignment="center")
@@ -1794,19 +1745,39 @@ q = st.text_input(
     on_change=reset_page,
 )
 
-scope = st.segmented_control(
-    "Scope",
-    ["All", "Pinned", "Saved", "Links", "Media"],
-    key="scope_filter",
-    on_change=reset_page,
-    label_visibility="collapsed",
-    width="stretch",
+scope_column, topic_column, format_column = st.columns(
+    [1.5, 2.2, 1.2],
+    vertical_alignment="bottom",
 )
+with scope_column:
+    scope = st.segmented_control(
+        "Show",
+        ["All", "Pinned", "Saved"],
+        key="scope_filter",
+        on_change=reset_page,
+        width="stretch",
+    )
+with topic_column:
+    selected_topic = st.selectbox(
+        "Topic",
+        available_topics,
+        key="topic_filter",
+        on_change=reset_page,
+    )
+with format_column:
+    content_label = st.selectbox(
+        "Format",
+        list(CONTENT_TYPES),
+        key="content_filter",
+        on_change=reset_page,
+    )
+
+scope = scope or "All"
 
 st.markdown(
     '<div class="library-context">'
-    "Describe what you remember. Search checks what is visible in images, "
-    "captions, documents, voice notes, filenames and links."
+    "Search checks image content, captions, documents, voice notes, "
+    "filenames and links. Combine topic and format filters when needed."
     "</div>",
     unsafe_allow_html=True,
 )
@@ -1819,6 +1790,53 @@ home_mode = (
 )
 
 if home_mode:
+    if review_count:
+        st.markdown(
+            '<div class="section-title">Review inbox</div>'
+            '<div class="section-subtitle">'
+            "Give unclassified captures a useful home as the library grows."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        with st.container(border=True):
+            review_metric, review_details, review_action = st.columns(
+                [1.2, 5, 1.3],
+                vertical_alignment="center",
+            )
+            with review_metric:
+                st.markdown(
+                    f'<div class="review-count">{review_count:,}</div>'
+                    '<div class="result-meta">need a topic</div>',
+                    unsafe_allow_html=True,
+                )
+            with review_details:
+                classified_count = max(
+                    int(stats["total"] or 0) - review_count,
+                    0,
+                )
+                st.markdown(
+                    '<div class="review-copy">'
+                    f'<strong>{classified_count:,} captures are already '
+                    "organised.</strong> Review the remainder when convenient; "
+                    "the original content stays searchable either way."
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                if review_results:
+                    review_titles = " · ".join(
+                        clean_preview(result_title(row), 48)
+                        for row in review_results
+                    )
+                    st.caption("Up next: " + review_titles)
+            with review_action:
+                st.button(
+                    "Review now",
+                    icon=":material/inbox:",
+                    on_click=open_bucket,
+                    args=("Uncategorised",),
+                    width="stretch",
+                )
+
     if pinned_results:
         pinned_header, pinned_action = st.columns(
             [8, 1],
@@ -1961,15 +1979,16 @@ if home_mode:
     st.markdown(
         '<div class="section-title">Browse by topic</div>'
         '<div class="section-subtitle">'
-        "Jump into a part of your archive without writing a query."
+        "Your archive is grouped by what each capture is about, not only "
+        "by file type."
         "</div>",
         unsafe_allow_html=True,
     )
-    for row_start in range(0, len(bucket_rows), 3):
-        bucket_columns = st.columns(3)
+    for row_start in range(0, len(topic_rows), 4):
+        bucket_columns = st.columns(4)
         for column, bucket in zip(
             bucket_columns,
-            bucket_rows[row_start : row_start + 3],
+            topic_rows[row_start : row_start + 4],
         ):
             category = bucket["display_category"]
             bucket_title = result_title(bucket)
@@ -1982,10 +2001,21 @@ if home_mode:
                         "</div>",
                         unsafe_allow_html=True,
                     )
-                    st.caption("captures")
+                    st.markdown(
+                        '<div class="bucket-description">'
+                        + html.escape(
+                            TOPIC_DESCRIPTIONS.get(
+                                category,
+                                "Related captures from your archive",
+                            )
+                        )
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
                     st.markdown(
                         '<div class="bucket-latest">'
-                        + html.escape(clean_preview(bucket_title, 84))
+                        + "Latest: "
+                        + html.escape(clean_preview(bucket_title, 68))
                         + "</div>",
                         unsafe_allow_html=True,
                     )
@@ -2006,6 +2036,8 @@ if q:
     active_label = f'Results for "{clean_preview(q, 50)}"'
 elif scope != "All":
     active_label = scope
+elif selected_topic == "Uncategorised":
+    active_label = "Review inbox"
 elif selected_topic != "All topics":
     active_label = selected_topic
 elif content_label != "Everything":
@@ -2039,7 +2071,19 @@ rows = search(
     starred_only=scope == "Saved",
     pinned_only=scope == "Pinned",
 )
+if selected_topic != "All topics":
+    rows = [
+        row
+        for row in rows
+        if (
+            row.get("display_category")
+            or row.get("category")
+            or "Uncategorised"
+        )
+        == selected_topic
+    ]
 rows = process_scope(rows, scope)
+rows = process_content_filter(rows, content_label)
 
 if not q:
     rows.sort(
@@ -2052,7 +2096,10 @@ if not q:
 
 result_label = "result" if len(rows) == 1 else "results"
 active_filters = []
-if selected_topic != "All topics" and selected_topic != active_label:
+if (
+    selected_topic not in {"All topics", "Uncategorised"}
+    and selected_topic != active_label
+):
     active_filters.append(selected_topic)
 if content_label != "Everything":
     active_filters.append(content_label)
@@ -2279,7 +2326,14 @@ for row in page_rows:
                 st.markdown("**What the image reader saw**")
                 st.write(clean_preview(vision_text, 900))
 
-        with st.expander("Organise"):
+        with st.expander(
+            (
+                "Choose a topic"
+                if selected_topic == "Uncategorised"
+                else "Organise"
+            ),
+            expanded=selected_topic == "Uncategorised",
+        ):
             editor_left, editor_right = st.columns([1, 2])
             with editor_left:
                 category_options = ORGANISE_TOPICS

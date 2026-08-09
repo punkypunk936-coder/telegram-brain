@@ -613,6 +613,38 @@ class TelegramBrainTests(unittest.TestCase):
 
         self.assertEqual([item["message_id"] for item in results], [60])
 
+    def test_semantic_name_search_rejects_unrelated_text(self):
+        self.insert(61, "A generic reaction with no named person")
+        row = self.connection.execute(
+            "SELECT id FROM messages WHERE message_id = 61"
+        ).fetchone()
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET embedding_json = ?, embedding_model = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps([1.0, 0.0]),
+                self.config.embed_model,
+                row["id"],
+            ),
+        )
+        self.connection.commit()
+        semantic_config = Settings(
+            **{**self.config.__dict__, "enable_embeddings": True}
+        )
+
+        with patch("tgbrain.embed", return_value=[1.0, 0.0]):
+            results = search(
+                self.connection,
+                semantic_config,
+                "Jensen Huang",
+                limit=20,
+            )
+
+        self.assertEqual(results, [])
+
     def test_unhelpful_image_description_is_not_indexed(self):
         root = Path(self.temp_dir.name)
         image_path = root / "unhelpful.png"

@@ -1587,6 +1587,21 @@ def _person_query_terms(query: str) -> list[str]:
     return terms if 2 <= len(terms) <= 3 else []
 
 
+def _covers_person_terms(value: str | None, terms: list[str]) -> bool:
+    value_terms = _query_terms(value or "")
+
+    def close(left: str, right: str) -> bool:
+        return left == right or (
+            min(len(left), len(right)) >= 4
+            and SequenceMatcher(None, left, right).ratio() >= 0.84
+        )
+
+    return bool(value_terms) and all(
+        any(close(term, value_term) for value_term in value_terms)
+        for term in terms
+    )
+
+
 def _matches_people_field(vision_text: str | None, terms: list[str]) -> bool:
     if not terms:
         return True
@@ -1596,18 +1611,7 @@ def _matches_people_field(vision_text: str | None, terms: list[str]) -> bool:
     )
     if not match or match.group(1).strip().lower() in {"", "none", "unknown"}:
         return False
-    people_terms = _query_terms(match.group(1))
-
-    def close(left: str, right: str) -> bool:
-        return left == right or (
-            min(len(left), len(right)) >= 4
-            and SequenceMatcher(None, left, right).ratio() >= 0.84
-        )
-
-    return all(
-        any(close(term, person_term) for person_term in people_terms)
-        for term in terms
-    )
+    return _covers_person_terms(match.group(1), terms)
 
 
 def _match_reasons(parts: list[dict], query: str) -> list[str]:
@@ -2053,16 +2057,19 @@ def search(
                 )
                 if score < SEMANTIC_MIN_SCORE:
                     continue
-                if (
-                    item["id"] not in found
-                    and item.get("media_type") == "image"
-                    and person_query_terms
-                    and not _matches_people_field(
-                        item.get("vision_text"),
-                        person_query_terms,
-                    )
-                ):
-                    continue
+                if item["id"] not in found and person_query_terms:
+                    if item.get("media_type") == "image":
+                        matches_person = _matches_people_field(
+                            item.get("vision_text"),
+                            person_query_terms,
+                        )
+                    else:
+                        matches_person = _covers_person_terms(
+                            item.get("indexed_text"),
+                            person_query_terms,
+                        )
+                    if not matches_person:
+                        continue
                 if item["id"] in found:
                     found[item["id"]]["_semantic_score"] = max(
                         found[item["id"]]["_semantic_score"],

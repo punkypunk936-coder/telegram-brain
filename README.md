@@ -18,7 +18,10 @@ Telegram's service chat when you use it as a personal inbox.
   keeps a dedicated Pinned library view in sync when items are pinned or
   unpinned.
 - Shows live-sync health inside the dashboard.
-- Opens on a history-driven bucket homepage with the newest classified capture.
+- Opens on a topic-first homepage with pinned items, the newest capture and a
+  review inbox for anything that still needs a category.
+- Combines saved-state, topic and format filters so the same archive can be
+  browsed as trading notes, writing, memes, links, documents or media.
 - Searches original text, OCR, documents, transcripts, link metadata and
   filenames with SQLite FTS5.
 - Explains why each result matched and whether every part has been indexed.
