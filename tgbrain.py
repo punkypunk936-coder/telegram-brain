@@ -491,6 +491,24 @@ CREATE TABLE IF NOT EXISTS runtime_state(
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS outbound_queue(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    destination_chat_id INTEGER NOT NULL,
+    text TEXT NOT NULL DEFAULT '',
+    files_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    telegram_message_ids_json TEXT NOT NULL DEFAULT '[]',
+    client_token TEXT NOT NULL UNIQUE,
+    next_attempt_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_status
+ON outbound_queue(status, next_attempt_at, id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     text,
     vision_text,

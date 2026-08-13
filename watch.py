@@ -4,6 +4,12 @@ import os
 
 from telethon import events
 
+from outbox import (
+    claim_next_outbound,
+    deliver_outbound,
+    recover_interrupted_outbox,
+)
+
 from tgbrain import (
     client,
     db,
@@ -54,6 +60,35 @@ async def heartbeat(
         await asyncio.sleep(60)
 
 
+async def deliver_queued_messages(
+    connection,
+    telegram,
+    config,
+    entity,
+) -> None:
+    recover_interrupted_outbox(connection)
+    while True:
+        try:
+            outbound = claim_next_outbound(connection)
+            if outbound is None:
+                await asyncio.sleep(1)
+                continue
+            delivered = await deliver_outbound(
+                telegram,
+                config,
+                connection,
+                entity,
+                outbound,
+            )
+            if delivered:
+                print("Sent queued Telegram item", outbound["id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print("Telegram outbox worker recovered from:", error)
+            await asyncio.sleep(2)
+
+
 async def main() -> None:
     config = settings(True)
     connection = db(config.db_path)
@@ -96,6 +131,14 @@ async def main() -> None:
                 entity,
             )
         )
+        outbox_task = asyncio.create_task(
+            deliver_queued_messages(
+                connection,
+                telegram,
+                config,
+                entity,
+            )
+        )
         print(
             "Watching chat",
             config.chat_id,
@@ -110,6 +153,7 @@ async def main() -> None:
             await telegram.run_until_disconnected()
         finally:
             heartbeat_task.cancel()
+            outbox_task.cancel()
     except Exception as error:
         set_runtime_state(connection, "watcher_status", "error")
         set_runtime_state(connection, "watcher_error", str(error))

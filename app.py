@@ -11,8 +11,15 @@ from urllib.parse import urlparse
 
 import streamlit as st
 from PIL import Image, ImageOps
+from streamlit_paste_button import paste_image_button
 
 from clipboard_utils import ClipboardError, copy_links, copy_media, copy_text
+from outbox import (
+    enqueue_outbound,
+    outbox_counts,
+    recent_outbound,
+    retry_outbound,
+)
 from service_control import (
     indexer_snapshot,
     reconcile_services,
@@ -316,6 +323,38 @@ st.markdown(
         .asset-file {
             border-bottom: 1px solid var(--brain-line);
             padding: 0.65rem 0 0.75rem;
+        }
+
+        .composer-title {
+            font-size: 1.35rem;
+            font-weight: 720;
+            line-height: 1.2;
+            margin: 1.4rem 0 0.25rem;
+        }
+
+        .composer-subtitle {
+            font-size: 0.88rem;
+            line-height: 1.5;
+            margin-bottom: 1rem;
+            max-width: 680px;
+            opacity: 0.66;
+        }
+
+        .delivery-status {
+            border-top: 1px solid var(--brain-line);
+            font-size: 0.82rem;
+            margin-top: 1.2rem;
+            padding-top: 0.85rem;
+        }
+
+        .delivery-sent {
+            color: var(--brain-teal);
+            font-weight: 680;
+        }
+
+        .delivery-pending {
+            color: var(--brain-amber);
+            font-weight: 680;
         }
 
         .asset-file-title {
@@ -1325,6 +1364,181 @@ def render_library_list(rows: list[dict], view: str) -> None:
             )
 
 
+def _pasted_image_bytes(image: Image.Image) -> bytes:
+    output = io.BytesIO()
+    image.convert("RGB").save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _reset_composer() -> None:
+    st.session_state.composer_version = (
+        int(st.session_state.get("composer_version", 0)) + 1
+    )
+    st.session_state.pasted_image = None
+    st.session_state.pasted_image_name = ""
+
+
+def render_delivery_status(config) -> None:
+    @st.fragment(run_every=2)
+    def status_fragment() -> None:
+        status_connection = db(config.db_path)
+        rows = recent_outbound(status_connection, 3)
+        counts = outbox_counts(status_connection)
+        status_connection.close()
+        if not rows:
+            return
+
+        pending = counts["queued"] + counts["sending"]
+        if pending:
+            st.markdown(
+                '<div class="delivery-status delivery-pending">'
+                f'{pending:,} item{"s" if pending != 1 else ""} on the way'
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        elif rows[0]["status"] == "sent":
+            st.markdown(
+                '<div class="delivery-status delivery-sent">'
+                "Delivered to Telegram"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        for row in rows:
+            if row["status"] == "failed":
+                failure, action = st.columns([6, 1], vertical_alignment="center")
+                with failure:
+                    st.error(
+                        "Telegram could not deliver this item. "
+                        + clean_preview(row.get("error") or "Unknown error", 180),
+                        icon=":material/error:",
+                    )
+                with action:
+                    if st.button(
+                        "Retry",
+                        icon=":material/refresh:",
+                        key=f"retry-outbound-{row['id']}",
+                        width="stretch",
+                    ):
+                        retry_connection = db(config.db_path)
+                        retry_outbound(retry_connection, row["id"])
+                        retry_connection.close()
+                        st.rerun()
+
+    status_fragment()
+
+
+def render_telegram_composer(config, connection) -> None:
+    if "composer_version" not in st.session_state:
+        st.session_state.composer_version = 0
+    if "pasted_image" not in st.session_state:
+        st.session_state.pasted_image = None
+    if "pasted_image_name" not in st.session_state:
+        st.session_state.pasted_image_name = ""
+
+    version = int(st.session_state.composer_version)
+    st.markdown(
+        '<div class="composer-title">Send to Telegram</div>'
+        '<div class="composer-subtitle">'
+        "Write, paste or attach anything here. Telegram remains the durable "
+        "source, and the confirmed message comes back into this searchable "
+        "library automatically."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    body = st.text_area(
+        "Message",
+        placeholder="Write or paste text, links, notes or a caption...",
+        height=280,
+        key=f"telegram-composer-text-{version}",
+        label_visibility="collapsed",
+    )
+
+    paste_column, upload_column = st.columns(2, vertical_alignment="top")
+    with paste_column:
+        st.markdown("**Paste from clipboard**")
+        pasted = paste_image_button(
+            label="Paste image",
+            text_color="#ffffff",
+            background_color="#177f78",
+            hover_background_color="#126b65",
+            key=f"telegram-paste-image-{version}",
+            errors="ignore",
+        )
+        if pasted.image_data is not None:
+            st.session_state.pasted_image = _pasted_image_bytes(
+                pasted.image_data
+            )
+            st.session_state.pasted_image_name = "pasted-image.png"
+        if st.session_state.pasted_image:
+            st.image(
+                st.session_state.pasted_image,
+                caption="Pasted image ready",
+                width=240,
+            )
+            if st.button(
+                "Remove",
+                icon=":material/close:",
+                key=f"remove-pasted-image-{version}",
+            ):
+                _reset_composer()
+                st.rerun()
+
+    with upload_column:
+        st.markdown("**Add media or files**")
+        uploads = st.file_uploader(
+            "Files",
+            accept_multiple_files=True,
+            key=f"telegram-composer-files-{version}",
+            label_visibility="collapsed",
+        )
+
+    attachments: list[tuple[str, str | None, bytes]] = []
+    if st.session_state.pasted_image:
+        attachments.append(
+            (
+                st.session_state.pasted_image_name or "pasted-image.png",
+                "image/png",
+                st.session_state.pasted_image,
+            )
+        )
+    for upload in uploads or []:
+        attachments.append((upload.name, upload.type, upload.getvalue()))
+
+    send_column, note_column = st.columns([1.4, 5], vertical_alignment="center")
+    with send_column:
+        send = st.button(
+            "Send to Telegram",
+            icon=":material/send:",
+            type="primary",
+            width="stretch",
+        )
+    with note_column:
+        st.caption(
+            "Queued safely if Telegram is reconnecting. Text layout and "
+            "original files are preserved."
+        )
+
+    if send and not body.strip() and not attachments:
+        st.warning(
+            "Add text or a file before sending.",
+            icon=":material/edit_note:",
+        )
+    elif send:
+        enqueue_outbound(
+            connection,
+            config,
+            text=body,
+            attachments=attachments,
+        )
+        _reset_composer()
+        st.toast("Sending to Telegram...", icon=":material/send:")
+        st.rerun()
+
+    render_delivery_status(config)
+
+
 config = settings()
 connection = db(config.db_path)
 
@@ -1338,6 +1552,8 @@ if "content_filter" not in st.session_state:
     st.session_state.content_filter = "Everything"
 if st.session_state.content_filter not in CONTENT_TYPES:
     st.session_state.content_filter = "Everything"
+if "app_mode" not in st.session_state:
+    st.session_state.app_mode = "Library"
 
 reconcile_services(config)
 
@@ -1702,7 +1918,7 @@ with header_left:
     st.markdown(
         '<div class="app-title">Telegram Brain</div>'
         '<div class="app-subtitle">'
-        "Find the text, links, documents and media you sent yourself."
+        "Send anything to Telegram, then find it again without digging."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1731,6 +1947,19 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True,
 )
+
+app_mode = st.segmented_control(
+    "Workspace",
+    ["Library", "Send to Telegram"],
+    key="app_mode",
+    width="content",
+    label_visibility="collapsed",
+)
+
+if app_mode == "Send to Telegram":
+    render_telegram_composer(config, connection)
+    connection.close()
+    st.stop()
 
 st.markdown(
     '<div class="search-label">Find anything</div>',

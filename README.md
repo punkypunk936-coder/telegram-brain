@@ -6,6 +6,8 @@ Telegram's service chat when you use it as a personal inbox.
 ## What it does
 
 - Imports the selected chat's existing history and media.
+- Sends text, pasted images and uploaded files back to the selected Telegram
+  chat through a durable local outbox, then confirms them in the library.
 - Catches up quietly and watches for new or edited messages.
 - Reads images with local macOS OCR and extracts text from PDFs, Office files
   and common text formats.
@@ -34,8 +36,10 @@ Telegram's service chat when you use it as a personal inbox.
 - Detects credentials and sensitive documents, then hides them from normal results.
 - Adds local semantic search and detailed image understanding through Ollama.
 
-The collector is read-only: it does not send, edit, delete or forward Telegram
-messages.
+The archive does not edit, delete or forward existing Telegram messages. The
+Send to Telegram workspace can create new messages only in the explicitly
+configured Telegram Brain chat. Queued sends survive app refreshes and brief
+connection failures.
 
 ## Setup on Mac
 
