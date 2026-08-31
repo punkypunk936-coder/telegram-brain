@@ -16,11 +16,13 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
+from PIL import Image, ImageOps
 
 from tgbrain import (
     ENRICHMENT_VERSION,
     METADATA_VERSION,
     Settings,
+    VIDEO_VISION_PROMPT_VERSION,
     VISION_PROMPT_VERSION,
     build_indexed_text,
     describe,
@@ -34,6 +36,21 @@ VISION_SOURCE = ROOT / "tools" / "vision_extract.swift"
 VISION_BINARY = ROOT / "data" / "bin" / "vision-extract"
 MAX_EXTRACTED_CHARS = 500_000
 MAX_LINK_BYTES = 2_000_000
+VIDEO_FRAME_COUNT = 6
+VIDEO_FRAME_SIZE = (480, 300)
+VIDEO_VISION_PROMPT = (
+    "These are representative frames sampled in time order from one saved "
+    "video. Index the video for a private visual search library. Return "
+    "concise plain text using exactly these labels: Summary, People, Visible "
+    "text, Objects, Setting, Sequence, Meme context, Search terms. Describe "
+    "what happens across the frames, not each frame separately. Read useful "
+    "on-screen text, but keep Visible text to the 15 most meaningful labels. "
+    "Name recognizable public figures only when confident. "
+    "For a meme or screen recording, identify the subject, app or site, action "
+    "and joke. Search terms must include concrete names, entities, actions, "
+    "visual traits, topics and likely user query phrases. Use Unknown rather "
+    "than inventing identity. Stay below 220 words and do not add a preamble."
+)
 
 
 class ContentUnavailable(RuntimeError):
@@ -388,6 +405,123 @@ def transcribe_audio(config: Settings, path: Path) -> str:
         )
 
 
+def video_has_audio(path: Path) -> bool:
+    import av
+
+    with av.open(str(path)) as container:
+        return any(stream.type == "audio" for stream in container.streams)
+
+
+def sample_video_frames(path: Path, count: int = VIDEO_FRAME_COUNT) -> list[Image.Image]:
+    import av
+
+    frames: list[Image.Image] = []
+    fingerprints: set[bytes] = set()
+    with av.open(str(path)) as container:
+        stream = next(
+            (candidate for candidate in container.streams if candidate.type == "video"),
+            None,
+        )
+        if stream is None:
+            raise ContentUnavailable("The media file has no video stream")
+        duration = (
+            float(container.duration / av.time_base)
+            if container.duration
+            else 0.0
+        )
+        if duration > 0:
+            if count == 1:
+                targets = [duration * 0.5]
+            else:
+                targets = [
+                    duration * (0.06 + (0.88 * index / (count - 1)))
+                    for index in range(count)
+                ]
+        else:
+            targets = [float(index) for index in range(count)]
+
+        for target in targets:
+            try:
+                container.seek(
+                    max(0, int(target * av.time_base)),
+                    any_frame=False,
+                    backward=True,
+                )
+                frame = next(container.decode(stream), None)
+            except Exception:
+                frame = None
+            if frame is None:
+                continue
+            image = frame.to_image().convert("RGB")
+            fingerprint = ImageOps.fit(
+                image,
+                (24, 24),
+                method=Image.Resampling.BILINEAR,
+            ).tobytes()
+            if fingerprint in fingerprints:
+                continue
+            fingerprints.add(fingerprint)
+            image.thumbnail(VIDEO_FRAME_SIZE, Image.Resampling.LANCZOS)
+            frames.append(image)
+
+    if not frames:
+        raise ContentUnavailable("No readable frames were found in the video")
+    return frames
+
+
+def build_video_contact_sheet(path: Path, output_path: Path) -> Path:
+    frames = sample_video_frames(path)
+    columns = 2
+    rows = (len(frames) + columns - 1) // columns
+    sheet = Image.new(
+        "RGB",
+        (VIDEO_FRAME_SIZE[0] * columns, VIDEO_FRAME_SIZE[1] * rows),
+        "black",
+    )
+    for index, frame in enumerate(frames):
+        tile = ImageOps.contain(
+            frame,
+            VIDEO_FRAME_SIZE,
+            method=Image.Resampling.LANCZOS,
+        )
+        left = (index % columns) * VIDEO_FRAME_SIZE[0]
+        top = (index // columns) * VIDEO_FRAME_SIZE[1]
+        x = left + (VIDEO_FRAME_SIZE[0] - tile.width) // 2
+        y = top + (VIDEO_FRAME_SIZE[1] - tile.height) // 2
+        sheet.paste(tile, (x, y))
+    sheet.save(output_path, format="JPEG", quality=88, optimize=True)
+    return output_path
+
+
+def describe_video(config: Settings, path: Path) -> str:
+    with tempfile.TemporaryDirectory() as directory:
+        contact_sheet = build_video_contact_sheet(
+            path,
+            Path(directory) / "video-frames.jpg",
+        )
+        frame_text = ""
+        try:
+            frame_text = extract_with_vision(contact_sheet)
+        except Exception:
+            pass
+        description = describe(
+            config,
+            str(contact_sheet),
+            prompt=VIDEO_VISION_PROMPT,
+            max_edge=1280,
+            max_tokens=400,
+            timeout_seconds=180,
+        )
+        if frame_text and frame_text.lower() not in description.lower():
+            description += "\nFrame OCR: " + clean_preview_text(frame_text, 1200)
+        return _clean_text(description)
+
+
+def clean_preview_text(value: str, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", value or "").strip()
+    return compact if len(compact) <= limit else compact[: limit - 1].rstrip() + "…"
+
+
 def _safe_public_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -485,7 +619,7 @@ def _extract_media(config: Settings, row: dict) -> str:
     if kind == "audio":
         return transcribe_audio(config, path)
     if kind == "video":
-        return transcribe_audio(config, path)
+        return transcribe_audio(config, path) if video_has_audio(path) else ""
     return ""
 
 
@@ -493,7 +627,7 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
     errors = []
     successes = 0
     expected = 0
-    extracted_text = ""
+    extracted_text = row.get("extracted_text") or ""
     vision_text = row.get("vision_text") or ""
     vision_model = row.get("vision_model") or ""
     vision_prompt_version = int(row.get("vision_prompt_version") or 0)
@@ -501,26 +635,39 @@ def enrich_record(config: Settings, row: dict) -> EnrichmentResult:
     media_path = row.get("media_path")
     if media_path:
         expected += 1
-        try:
-            extracted_text = _extract_media(config, row)
+        if int(row.get("enrichment_version") or 0) >= ENRICHMENT_VERSION:
             successes += 1
-        except Exception as error:
-            errors.append(f"Media: {error}")
-        if row.get("media_type") == "image" and config.enable_vision:
+        else:
+            try:
+                extracted_text = _extract_media(config, row)
+                successes += 1
+            except Exception as error:
+                errors.append(f"Media: {error}")
+        media_type = row.get("media_type")
+        if media_type in {"image", "video"} and config.enable_vision:
             expected += 1
             vision_attempted_at = datetime.now(timezone.utc).isoformat()
             try:
-                candidate_vision_text = describe(config, media_path)
+                candidate_vision_text = (
+                    describe_video(config, Path(media_path))
+                    if media_type == "video"
+                    else describe(config, media_path)
+                )
                 if not _valid_vision_description(candidate_vision_text):
                     raise ContentUnavailable(
                         "The vision model returned no useful description"
                     )
                 vision_text = candidate_vision_text
                 vision_model = config.vision_model
-                vision_prompt_version = VISION_PROMPT_VERSION
+                vision_prompt_version = (
+                    VIDEO_VISION_PROMPT_VERSION
+                    if media_type == "video"
+                    else VISION_PROMPT_VERSION
+                )
                 successes += 1
             except Exception as error:
-                errors.append(f"Image understanding: {error}")
+                label = "Video understanding" if media_type == "video" else "Image understanding"
+                errors.append(f"{label}: {error}")
 
     try:
         urls = json.loads(row.get("urls_json") or "[]")
@@ -654,12 +801,24 @@ def pending_count(
     missing_vision = (
         """
         OR (
-            media_type = 'image'
-            AND media_path IS NOT NULL
+            media_path IS NOT NULL
             AND (
-                TRIM(vision_text) = ''
-                OR COALESCE(vision_model, '') != ?
-                OR vision_prompt_version < ?
+                (
+                    media_type = 'image'
+                    AND (
+                        TRIM(vision_text) = ''
+                        OR COALESCE(vision_model, '') != ?
+                        OR vision_prompt_version < ?
+                    )
+                )
+                OR (
+                    media_type = 'video'
+                    AND (
+                        TRIM(vision_text) = ''
+                        OR COALESCE(vision_model, '') != ?
+                        OR vision_prompt_version < ?
+                    )
+                )
             )
         )
         """
@@ -681,7 +840,14 @@ def pending_count(
     )
     params: list = [ENRICHMENT_VERSION]
     if require_vision:
-        params.extend([vision_model, VISION_PROMPT_VERSION])
+        params.extend(
+            [
+                vision_model,
+                VISION_PROMPT_VERSION,
+                vision_model,
+                VIDEO_VISION_PROMPT_VERSION,
+            ]
+        )
     if require_embeddings:
         params.append(embed_model)
     return int(
@@ -714,12 +880,24 @@ def next_pending(
     missing_vision = (
         """
         OR (
-            media_type = 'image'
-            AND media_path IS NOT NULL
+            media_path IS NOT NULL
             AND (
-                TRIM(vision_text) = ''
-                OR COALESCE(vision_model, '') != ?
-                OR vision_prompt_version < ?
+                (
+                    media_type = 'image'
+                    AND (
+                        TRIM(vision_text) = ''
+                        OR COALESCE(vision_model, '') != ?
+                        OR vision_prompt_version < ?
+                    )
+                )
+                OR (
+                    media_type = 'video'
+                    AND (
+                        TRIM(vision_text) = ''
+                        OR COALESCE(vision_model, '') != ?
+                        OR vision_prompt_version < ?
+                    )
+                )
             )
             AND (
                 vision_attempted_at IS NULL
@@ -750,7 +928,14 @@ def next_pending(
     )
     params: list = [ENRICHMENT_VERSION]
     if require_vision:
-        params.extend([vision_model, VISION_PROMPT_VERSION])
+        params.extend(
+            [
+                vision_model,
+                VISION_PROMPT_VERSION,
+                vision_model,
+                VIDEO_VISION_PROMPT_VERSION,
+            ]
+        )
     if require_embeddings:
         params.append(embed_model)
     rows = connection.execute(
@@ -766,9 +951,12 @@ def next_pending(
           )
         ORDER BY
             CASE
+                WHEN media_type = 'video'
+                 AND datetime(date_utc) >= datetime('now', '-90 days')
+                    THEN 0
                 WHEN media_type = 'image'
                  AND datetime(date_utc) >= datetime('now', '-30 days')
-                    THEN 0
+                    THEN 1
                 WHEN media_type = 'image'
                  AND (
                     LOWER(vision_text) LIKE '%person%'
@@ -779,11 +967,12 @@ def next_pending(
                     OR LOWER(vision_text) LIKE '%boy%'
                     OR LOWER(vision_text) LIKE '%president%'
                     OR LOWER(vision_text) LIKE '%leader%'
-                 ) THEN 1
-                WHEN media_type = 'image' THEN 2
-                WHEN media_type IN ('pdf', 'document', 'audio') THEN 3
-                WHEN urls_json != '[]' THEN 4
-                ELSE 5
+                 ) THEN 2
+                WHEN media_type = 'video' THEN 3
+                WHEN media_type = 'image' THEN 4
+                WHEN media_type IN ('pdf', 'document', 'audio') THEN 5
+                WHEN urls_json != '[]' THEN 6
+                ELSE 7
             END,
             date_utc DESC,
             message_id DESC

@@ -35,6 +35,7 @@ METADATA_VERSION = 9
 ENRICHMENT_VERSION = 4
 CAPTURE_VERSION = 1
 VISION_PROMPT_VERSION = 2
+VIDEO_VISION_PROMPT_VERSION = 1
 SEMANTIC_MIN_SCORE = 0.40
 _INITIALIZED_DATABASES: set[str] = set()
 MNEMONIC = Mnemonic("english")
@@ -695,8 +696,16 @@ def image_for_vision(path: str, max_edge: int = 768) -> str:
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
-def describe(config: Settings, path: str) -> str:
-    image = image_for_vision(path)
+def describe(
+    config: Settings,
+    path: str,
+    *,
+    prompt: str | None = None,
+    max_edge: int = 768,
+    max_tokens: int = 240,
+    timeout_seconds: int = 60,
+) -> str:
+    image = image_for_vision(path, max_edge=max_edge)
     data = ollama_post(
         f"{config.ollama_url}/api/chat",
         {
@@ -705,12 +714,12 @@ def describe(config: Settings, path: str) -> str:
             "keep_alive": "5m",
             "options": {
                 "temperature": 0,
-                "num_predict": 240,
+                "num_predict": max_tokens,
             },
             "messages": [
                 {
                     "role": "user",
-                    "content": (
+                    "content": prompt or (
                         "Index this image for a private visual search library. "
                         "Return concise plain text using exactly these labels: "
                         "Summary, People, Visible text, Objects, Setting, "
@@ -727,7 +736,7 @@ def describe(config: Settings, path: str) -> str:
                 }
             ],
         },
-        timeout=60,
+        timeout=timeout_seconds,
     )
     message = data.get("message", {})
     content = message.get("content", "").strip()
@@ -738,6 +747,19 @@ def describe(config: Settings, path: str) -> str:
             message.get("thinking", ""),
         ).strip()
     return re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", content).strip()
+
+
+def is_gif_media(
+    media_type: str | None,
+    file_name: str | None,
+    mime_type: str | None,
+) -> bool:
+    """Identify actual GIF assets without treating every MP4 as a GIF."""
+    name = (file_name or "").lower()
+    mime = (mime_type or "").lower()
+    if mime == "image/gif" or name.endswith(".gif"):
+        return True
+    return (media_type or "").lower() == "video" and ".gif." in name
 
 
 def media_kind(path: str | None, mime: str | None) -> str | None:
@@ -1676,8 +1698,17 @@ def _match_reasons(parts: list[dict], query: str) -> list[str]:
         reasons.append("Matched text extracted from a document")
     if "audio" in extracted_types:
         reasons.append("Matched a local voice-note transcript")
-    if any(matched(part.get("vision_text")) for part in parts):
+    if "video" in extracted_types:
+        reasons.append("Matched words spoken in a video")
+    vision_types = {
+        part.get("media_type")
+        for part in parts
+        if matched(part.get("vision_text"))
+    }
+    if "image" in vision_types:
         reasons.append("Matched an AI image description")
+    if "video" in vision_types:
+        reasons.append("Matched people, scenes or text seen in a video")
     if not reasons and any(
         float(part.get("_semantic_score") or 0) > 0 for part in parts
     ):

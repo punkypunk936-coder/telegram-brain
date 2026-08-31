@@ -11,8 +11,9 @@ Telegram's service chat when you use it as a personal inbox.
 - Catches up quietly and watches for new or edited messages.
 - Reads images with local macOS OCR and extracts text from PDFs, Office files
   and common text formats.
-- Transcribes voice notes locally with whisper.cpp and fetches public link
-  titles and descriptions.
+- Transcribes voice notes and video audio locally with whisper.cpp, samples
+  representative video frames for OCR and visual understanding, and fetches
+  public link titles and descriptions.
 - Combines adjacent message parts and media albums into one capture.
 - Keeps the earliest media asset and hides exact or safely detected re-encoded
   repeat shares from the visible library.
@@ -20,12 +21,14 @@ Telegram's service chat when you use it as a personal inbox.
   keeps a dedicated Pinned library view in sync when items are pinned or
   unpinned.
 - Shows live-sync health inside the dashboard.
-- Opens on a topic-first homepage with pinned items, the newest capture and a
-  review inbox for anything that still needs a category.
+- Opens on a chronological, Telegram-like capture feed with pinned items,
+  progressive loading and topic filters for open-ended browsing.
+- Separates images, videos, GIFs, links, files and voice notes into dedicated
+  library views without mixing link previews into media grids.
 - Combines saved-state, topic and format filters so the same archive can be
   browsed as trading notes, writing, memes, links, documents or media.
-- Searches original text, OCR, documents, transcripts, link metadata and
-  filenames with SQLite FTS5.
+- Searches original text, OCR, documents, transcripts, link metadata,
+  filenames, image descriptions and video scenes with SQLite FTS5.
 - Explains why each result matched and whether every part has been indexed.
 - Organises results by topic and type while keeping chronology in the database.
 - Copies full text, individual or grouped web links, paste-ready images,
@@ -147,9 +150,9 @@ ENABLE_VISION=true
 ```
 
 Exact keyword search remains available without Ollama.
-The image reader records which model and prompt produced each description. If
-either changes, existing images are re-read quietly in the background, with new
-images handled first.
+The visual reader records which model and prompt produced each description. If
+either changes, existing images and videos are re-read quietly in the
+background, with recent media handled first.
 
 ## Privacy
 

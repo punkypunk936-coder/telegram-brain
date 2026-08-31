@@ -22,10 +22,12 @@ from media_dedupe import (
 )
 from tgbrain import (
     Settings,
+    VIDEO_VISION_PROMPT_VERSION,
     VISION_PROMPT_VERSION,
     build_indexed_text,
     db,
     detect_category,
+    is_gif_media,
     mask_sensitive_text,
     search,
     sensitive_status,
@@ -368,6 +370,40 @@ class TelegramBrainTests(unittest.TestCase):
         )
         self.assertEqual(refreshed["content_status"], "ready")
 
+    def test_visual_reread_reuses_existing_media_extraction(self):
+        root = Path(self.temp_dir.name)
+        video_path = root / "already-transcribed.mp4"
+        video_path.write_bytes(b"test video placeholder")
+        self.insert(
+            41,
+            "",
+            media_type="video",
+            media_path=video_path,
+            file_name=video_path.name,
+        )
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET extracted_text = ?, enrichment_version = ?,
+                content_status = 'ready'
+            WHERE message_id = 41
+            """,
+            ("Existing transcript", tgbrain.ENRICHMENT_VERSION),
+        )
+        self.connection.commit()
+        row = dict(
+            self.connection.execute(
+                "SELECT * FROM messages WHERE message_id = 41"
+            ).fetchone()
+        )
+
+        with patch("content_indexing._extract_media") as extractor:
+            result = enrich_record(self.config, row)
+
+        extractor.assert_not_called()
+        self.assertEqual(result.extracted_text, "Existing transcript")
+        self.assertEqual(result.content_status, "ready")
+
     def test_search_explains_document_text_match(self):
         self.insert(
             50,
@@ -517,6 +553,118 @@ class TelegramBrainTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertEqual([row["message_id"] for row in queued], [57])
+
+    def test_video_scene_description_is_indexed_and_searchable(self):
+        root = Path(self.temp_dir.name)
+        video_path = root / "launch-demo.mp4"
+        video_path.write_bytes(b"test video placeholder")
+        self.insert(
+            62,
+            "",
+            media_type="video",
+            media_path=video_path,
+            file_name=video_path.name,
+        )
+        row = dict(
+            self.connection.execute(
+                "SELECT * FROM messages WHERE message_id = 62"
+            ).fetchone()
+        )
+        vision_config = Settings(
+            **{**self.config.__dict__, "enable_vision": True}
+        )
+        with (
+            patch("content_indexing._extract_media", return_value=""),
+            patch(
+                "content_indexing.describe_video",
+                return_value=(
+                    "Summary: Jensen Huang presents a GPU on stage.\n"
+                    "People: Jensen Huang\n"
+                    "Visible text: NVIDIA Blackwell\n"
+                    "Objects: GPU, stage screen\n"
+                    "Setting: Technology keynote\n"
+                    "Sequence: He lifts the GPU and addresses the audience.\n"
+                    "Meme context: None\n"
+                    "Search terms: Jensen Huang keynote NVIDIA GPU Blackwell"
+                ),
+            ),
+        ):
+            apply_enrichment(
+                self.connection,
+                enrich_record(vision_config, row),
+            )
+
+        results = search(
+            self.connection,
+            self.config,
+            "Jensen Huang video",
+            limit=20,
+        )
+
+        self.assertEqual([item["message_id"] for item in results], [62])
+        self.assertIn(
+            "Matched people, scenes or text seen in a video",
+            results[0]["_match_reasons"],
+        )
+        indexed = self.connection.execute(
+            """
+            SELECT vision_model, vision_prompt_version, content_status
+            FROM messages WHERE message_id = 62
+            """
+        ).fetchone()
+        self.assertEqual(indexed["vision_model"], vision_config.vision_model)
+        self.assertEqual(
+            indexed["vision_prompt_version"],
+            VIDEO_VISION_PROMPT_VERSION,
+        )
+        self.assertEqual(indexed["content_status"], "ready")
+
+    def test_videos_are_not_all_classified_as_gifs(self):
+        self.assertFalse(
+            is_gif_media("video", "screen-recording.mp4", "video/mp4")
+        )
+        self.assertTrue(
+            is_gif_media("video", "reaction.gif.mp4", "video/mp4")
+        )
+        self.assertTrue(is_gif_media("image", "reaction.gif", "image/gif"))
+
+    def test_existing_video_without_visual_index_is_queued(self):
+        root = Path(self.temp_dir.name)
+        video_path = root / "silent-scene.mp4"
+        video_path.write_bytes(b"test video placeholder")
+        self.insert(
+            63,
+            "",
+            media_type="video",
+            media_path=video_path,
+            file_name=video_path.name,
+        )
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET content_status = 'ready', enrichment_version = ?,
+                vision_text = '', vision_model = '',
+                vision_prompt_version = 0
+            WHERE message_id = 63
+            """,
+            (tgbrain.ENRICHMENT_VERSION,),
+        )
+        self.connection.commit()
+
+        count = pending_count(
+            self.connection,
+            require_vision=True,
+            vision_model=self.config.vision_model,
+        )
+        queued = next_pending(
+            self.connection,
+            limit=5,
+            require_vision=True,
+            vision_model=self.config.vision_model,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual([row["message_id"] for row in queued], [63])
 
     def test_semantic_search_finds_a_described_image_without_shared_words(self):
         self.insert(58, "", media_type="image", file_name="capture.jpg")

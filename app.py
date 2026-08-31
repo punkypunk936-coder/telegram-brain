@@ -31,9 +31,11 @@ from service_control import (
     watcher_snapshot,
 )
 from tgbrain import (
+    VIDEO_VISION_PROMPT_VERSION,
     VISION_PROMPT_VERSION,
     db,
     get_runtime_state,
+    is_gif_media,
     mask_sensitive_text,
     search,
     set_item_state,
@@ -304,6 +306,38 @@ st.markdown(
             opacity: 0.58;
         }
 
+        .feed-intro {
+            align-items: baseline;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem 0.8rem;
+            margin: 1rem 0 0.55rem;
+        }
+
+        .feed-intro strong {
+            font-size: 1.08rem;
+            font-weight: 710;
+        }
+
+        .feed-intro span {
+            font-size: 0.8rem;
+            opacity: 0.6;
+        }
+
+        .feed-copy {
+            font-size: 0.94rem;
+            line-height: 1.55;
+            margin: 0.45rem 0 0.65rem;
+            white-space: pre-wrap;
+        }
+
+        .feed-visual-note {
+            font-size: 0.8rem;
+            line-height: 1.4;
+            margin: 0.25rem 0 0.55rem;
+            opacity: 0.66;
+        }
+
         .detail-kicker {
             font-size: 0.72rem;
             font-weight: 700;
@@ -482,17 +516,6 @@ ORGANISE_TOPICS = [
     "Uncategorised",
 ]
 
-CONTENT_TYPES = {
-    "Everything": "all",
-    "Text only": "text",
-    "Links": "all",
-    "Images": "image",
-    "Video": "video",
-    "Audio": "audio",
-    "PDFs": "pdf",
-    "Documents": "document",
-}
-
 PRIMARY_TOPIC_ORDER = [
     "Trading & Markets",
     "Technology & AI",
@@ -504,41 +527,15 @@ PRIMARY_TOPIC_ORDER = [
     "Personal & Admin",
 ]
 
-TOPIC_DESCRIPTIONS = {
-    "Trading & Markets": "Setups, theses, market notes and charts",
-    "Technology & AI": "Models, chips, tools and technical research",
-    "Work & Career": "Applications, professional notes and work history",
-    "Writing": "Drafts, passages and ideas worth developing",
-    "Research & Learning": "Reading notes, explainers and useful references",
-    "Ideas & Building": "Product ideas, experiments and things to make",
-    "Memes & Culture": "Memes, reactions and internet culture",
-    "Personal & Admin": "Personal reminders, plans and life admin",
-}
-
 def reset_page() -> None:
     st.session_state.page = 1
+    st.session_state.feed_limit = 12
     st.session_state.selected_library_item = None
 
 
-def open_bucket(category: str) -> None:
-    st.session_state.topic_filter = category
-    st.session_state.content_filter = "Everything"
-    st.session_state.scope_filter = "All"
-    st.session_state.search_query = ""
-    st.session_state.page = 1
-
-
-def show_homepage() -> None:
-    st.session_state.topic_filter = "All topics"
-    st.session_state.content_filter = "Everything"
-    st.session_state.scope_filter = "All"
-    st.session_state.search_query = ""
-    st.session_state.page = 1
-
-
 def open_pinned() -> None:
+    st.session_state.library_view = "Feed"
     st.session_state.topic_filter = "All topics"
-    st.session_state.content_filter = "Everything"
     st.session_state.scope_filter = "Pinned"
     st.session_state.search_query = ""
     st.session_state.page = 1
@@ -639,24 +636,6 @@ def result_title(row: dict) -> str:
         return row["file_name"]
     kind = row.get("media_type")
     return f"Saved {kind}" if kind else "Saved message"
-
-
-def process_scope(rows: list[dict], scope: str) -> list[dict]:
-    if scope == "Pinned":
-        return [row for row in rows if row.get("is_pinned")]
-    if scope == "Saved":
-        return [row for row in rows if row.get("starred")]
-    if scope == "Links":
-        return [row for row in rows if parse_urls(row)]
-    if scope == "Media":
-        return [row for row in rows if row.get("media_path")]
-    return rows
-
-
-def process_content_filter(rows: list[dict], label: str) -> list[dict]:
-    if label == "Links":
-        return [row for row in rows if parse_urls(row)]
-    return rows
 
 
 def media_copy_label(items: list[dict]) -> str:
@@ -884,16 +863,18 @@ def service_age(timestamp: str | None) -> str:
     return f"{seconds // 3600}h ago"
 
 
-LIBRARY_VIEWS = ("Media", "Files", "Links", "Voice", "GIFs")
+LIBRARY_VIEWS = ("Feed", "Media", "Videos", "GIFs", "Links", "Files", "Voice")
 GALLERY_PAGE_SIZE = 36
 LIST_PAGE_SIZE = 18
 
 
 def _is_gif_item(item: dict) -> bool:
     path = Path(str(item.get("path") or item.get("media_path") or ""))
-    mime = str(item.get("mime_type") or "").lower()
-    media_type = str(item.get("media_type") or "").lower()
-    return media_type == "video" or mime == "image/gif" or path.suffix.lower() == ".gif"
+    return is_gif_media(
+        item.get("media_type"),
+        item.get("file_name") or path.name,
+        item.get("mime_type"),
+    )
 
 
 def row_matches_view(row: dict, view: str) -> bool:
@@ -908,6 +889,12 @@ def row_matches_view(row: dict, view: str) -> bool:
         )
     if view == "GIFs":
         return any(_is_gif_item(item) for item in media_items)
+    if view == "Videos":
+        return any(
+            str(item.get("media_type") or "").lower() == "video"
+            and not _is_gif_item(item)
+            for item in media_items
+        )
     if view == "Files":
         return any(
             str(item.get("media_type") or "").lower() in {"pdf", "document"}
@@ -932,9 +919,14 @@ def _view_sql(view: str) -> str:
         """
     if view == "GIFs":
         return """
-            (m.media_type = 'video'
-             OR LOWER(COALESCE(m.file_name, '')) LIKE '%.gif'
+            (LOWER(COALESCE(m.file_name, '')) LIKE '%.gif'
+             OR LOWER(COALESCE(m.file_name, '')) LIKE '%.gif.%'
              OR LOWER(COALESCE(m.mime_type, '')) = 'image/gif')
+        """
+    if view == "Videos":
+        return """
+            m.media_type = 'video'
+            AND LOWER(COALESCE(m.file_name, '')) NOT LIKE '%.gif.%'
         """
     if view == "Files":
         return "m.media_type IN ('pdf', 'document')"
@@ -1002,6 +994,7 @@ def search_library(
 ) -> list[dict]:
     kind = {
         "Media": "image",
+        "Videos": "video",
         "GIFs": "video",
         "Voice": "audio",
     }.get(view, "all")
@@ -1219,7 +1212,12 @@ def render_selected_item(connection, row: dict) -> None:
         if vision or row.get("extracted_text"):
             with st.expander("Indexed context"):
                 if vision:
-                    st.markdown("**Image understanding**")
+                    label = (
+                        "Video understanding"
+                        if row.get("media_type") == "video"
+                        else "Image understanding"
+                    )
+                    st.markdown(f"**{label}**")
                     st.write(clean_preview(vision, 1400))
                 if row.get("extracted_text"):
                     st.markdown("**Extracted content**")
@@ -1229,6 +1227,39 @@ def render_selected_item(connection, row: dict) -> None:
                             1400,
                         )
                     )
+        with st.expander("Organise"):
+            current_category = (
+                row.get("user_category")
+                or row.get("category")
+                or "Uncategorised"
+            )
+            if current_category not in ORGANISE_TOPICS:
+                current_category = "Uncategorised"
+            user_category = st.selectbox(
+                "Topic",
+                ORGANISE_TOPICS,
+                index=ORGANISE_TOPICS.index(current_category),
+                key=f"detail-category-{row['id']}",
+            )
+            user_note = st.text_area(
+                "Private note",
+                value=row.get("note") or "",
+                key=f"detail-note-{row['id']}",
+                height=88,
+            )
+            if st.button(
+                "Save changes",
+                icon=":material/check:",
+                key=f"detail-organise-{row['id']}",
+            ):
+                set_item_state(
+                    connection,
+                    row["id"],
+                    note=user_note,
+                    user_category=user_category,
+                )
+                st.toast("Saved.")
+                st.rerun()
 
 
 def render_media_grid(rows: list[dict], view: str) -> None:
@@ -1238,6 +1269,12 @@ def render_media_grid(rows: list[dict], view: str) -> None:
             if view == "Media" and item.get("media_type") == "image" and not _is_gif_item(item):
                 assets.append((row, item))
             elif view == "GIFs" and _is_gif_item(item):
+                assets.append((row, item))
+            elif (
+                view == "Videos"
+                and item.get("media_type") == "video"
+                and not _is_gif_item(item)
+            ):
                 assets.append((row, item))
     column_count = 6 if view == "Media" else 3
     for row_start in range(0, len(assets), column_count):
@@ -1255,8 +1292,14 @@ def render_media_grid(rows: list[dict], view: str) -> None:
                         st.image(thumbnail, width="stretch")
                     else:
                         st.image(str(path), width="stretch")
+                elif item["_path"].suffix.lower() == ".gif":
+                    st.image(str(item["_path"]), width="stretch")
                 else:
-                    st.video(str(item["_path"]), autoplay=False, loop=True)
+                    st.video(
+                        str(item["_path"]),
+                        autoplay=False,
+                        loop=view == "GIFs",
+                    )
                 copy_col, open_col = st.columns(2, gap="small")
                 with copy_col:
                     if st.button(
@@ -1539,6 +1582,358 @@ def render_telegram_composer(config, connection) -> None:
     render_delivery_status(config)
 
 
+def render_feed_card(
+    connection,
+    row: dict,
+    *,
+    key_prefix: str,
+    explain_match: bool = False,
+) -> None:
+    media_items = existing_media_items(row)
+    text = mask_sensitive_text(row.get("text") or "").strip()
+    extracted_text = mask_sensitive_text(row.get("extracted_text") or "").strip()
+    vision_text = mask_sensitive_text(row.get("vision_text") or "").strip()
+    title = result_title({**row, "text": text})
+    category = row.get("display_category") or row.get("category") or "Uncategorised"
+
+    with st.container(border=True):
+        heading, save_action, detail_action = st.columns(
+            [12, 1, 1],
+            vertical_alignment="top",
+        )
+        with heading:
+            if row.get("is_pinned"):
+                st.badge("Pinned", color="orange")
+            st.badge(category, color="gray")
+            if row.get("content_status") not in {None, "ready"}:
+                status_label, status_color = index_label(row)
+                st.badge(status_label, color=status_color)
+            st.markdown(
+                f'<div class="result-title">{html.escape(title)}</div>',
+                unsafe_allow_html=True,
+            )
+        with save_action:
+            if st.button(
+                "",
+                icon=(
+                    ":material/star:"
+                    if row.get("starred")
+                    else ":material/star_outline:"
+                ),
+                help="Remove from saved" if row.get("starred") else "Save",
+                key=f"{key_prefix}-save-{row['id']}",
+                width="stretch",
+            ):
+                set_item_state(
+                    connection,
+                    row["id"],
+                    starred=not bool(row.get("starred")),
+                )
+                st.rerun()
+        with detail_action:
+            st.button(
+                "",
+                icon=":material/open_in_full:",
+                help="Open details",
+                key=f"{key_prefix}-detail-{row['id']}",
+                on_click=select_library_item,
+                args=(row["id"],),
+                width="stretch",
+            )
+
+        images = [
+            item
+            for item in media_items
+            if item.get("media_type") == "image" and not _is_gif_item(item)
+        ]
+        if images:
+            columns = st.columns(min(3, len(images)), gap="small")
+            for index, item in enumerate(images[:6]):
+                with columns[index % len(columns)]:
+                    st.image(str(item["_path"]), width="stretch")
+
+        for item in media_items:
+            if item.get("media_type") == "video":
+                st.video(
+                    str(item["_path"]),
+                    autoplay=False,
+                    loop=_is_gif_item(item),
+                )
+            elif _is_gif_item(item):
+                st.image(str(item["_path"]), width="stretch")
+            elif item.get("media_type") == "audio":
+                st.audio(str(item["_path"]), autoplay=False)
+
+        primary_copy = text or extracted_text
+        if text:
+            first_line = next(
+                (line.strip() for line in text.splitlines() if line.strip()),
+                "",
+            )
+            if first_line and primary_copy.startswith(first_line):
+                primary_copy = primary_copy[len(first_line) :].strip()
+        if primary_copy:
+            st.markdown(
+                '<div class="feed-copy">'
+                + html.escape(clean_preview(primary_copy, 760))
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+            if len(primary_copy) > 760:
+                with st.expander("Read full text"):
+                    st.write(primary_copy)
+        elif vision_text:
+            st.markdown(
+                '<div class="feed-visual-note">'
+                + html.escape(visual_preview(vision_text))
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+
+        render_copy_actions(row, key_prefix)
+        render_link_actions(row, key_prefix)
+
+        if explain_match:
+            with st.expander("Why this appeared"):
+                for reason in row.get("_match_reasons") or [
+                    "Matched the capture's searchable content"
+                ]:
+                    st.markdown(f"- {reason}")
+                if vision_text:
+                    st.caption("Visual index")
+                    st.write(clean_preview(vision_text, 900))
+
+
+def render_library_workspace(
+    connection,
+    config,
+    *,
+    available_topics: list[str],
+    stats,
+    pinned_results: list[dict],
+) -> None:
+    st.markdown(
+        '<div class="search-label">Search the whole archive</div>',
+        unsafe_allow_html=True,
+    )
+    query = st.text_input(
+        "Search",
+        placeholder=(
+            "Describe a person, scene, video, meme, quote or idea you remember"
+        ),
+        key="search_query",
+        label_visibility="collapsed",
+        on_change=reset_page,
+    )
+
+    view = st.segmented_control(
+        "Browse",
+        LIBRARY_VIEWS,
+        key="library_view",
+        width="stretch",
+        label_visibility="collapsed",
+        on_change=reset_page,
+    ) or "Feed"
+
+    scope_column, topic_column = st.columns(
+        [1.3, 2.4],
+        vertical_alignment="bottom",
+    )
+    with scope_column:
+        scope = st.segmented_control(
+            "Show",
+            ["All", "Pinned", "Saved"],
+            key="scope_filter",
+            on_change=reset_page,
+            width="stretch",
+        ) or "All"
+    with topic_column:
+        topic = st.selectbox(
+            "Topic",
+            available_topics,
+            key="topic_filter",
+            on_change=reset_page,
+        )
+
+    selected = load_library_row(
+        connection,
+        st.session_state.get("selected_library_item"),
+    )
+    if selected:
+        render_selected_item(connection, selected)
+
+    if view == "Feed":
+        requested_kind = (
+            "video"
+            if re.search(r"\b(?:video|clip|screen recording)\b", query, re.IGNORECASE)
+            else "all"
+        )
+        search_limit = (
+            max(200, st.session_state.feed_limit + 1)
+            if query
+            else st.session_state.feed_limit + 1
+        )
+        rows = search(
+            connection,
+            config,
+            query,
+            requested_kind,
+            search_limit,
+            include_sensitive=False,
+            category=topic,
+            starred_only=scope == "Saved",
+            pinned_only=scope == "Pinned",
+        )
+        if not query:
+            rows.sort(
+                key=lambda row: (
+                    row_datetime(row["date_utc"]),
+                    row["message_id"],
+                ),
+                reverse=True,
+            )
+
+        home_feed = (
+            not query and scope == "All" and topic == "All topics"
+        )
+        if home_feed and pinned_results:
+            pinned_header, pinned_action = st.columns(
+                [8, 1],
+                vertical_alignment="center",
+            )
+            with pinned_header:
+                st.markdown(
+                    '<div class="pinned-section">'
+                    '<div class="pinned-title">Pinned</div>'
+                    '<div class="section-subtitle">'
+                    "The important items from your Telegram chat."
+                    "</div></div>",
+                    unsafe_allow_html=True,
+                )
+            with pinned_action:
+                st.button(
+                    "View all",
+                    icon=":material/push_pin:",
+                    key="feed-view-pins",
+                    on_click=open_pinned,
+                )
+            pinned_columns = st.columns(min(3, len(pinned_results)))
+            for index, pinned in enumerate(pinned_results[:3]):
+                with pinned_columns[index]:
+                    with st.container(border=True):
+                        st.badge(
+                            pinned.get("display_category") or "Uncategorised",
+                            color="gray",
+                        )
+                        st.markdown(
+                            '<div class="result-title">'
+                            + html.escape(result_title(pinned))
+                            + "</div>",
+                            unsafe_allow_html=True,
+                        )
+                        st.button(
+                            "Open",
+                            icon=":material/open_in_full:",
+                            key=f"feed-pin-{pinned['id']}",
+                            on_click=select_library_item,
+                            args=(pinned["id"],),
+                            width="stretch",
+                        )
+            pinned_ids = {row["id"] for row in pinned_results}
+            rows = [row for row in rows if row["id"] not in pinned_ids]
+
+        label = "Search results" if query else "Recent captures"
+        subtitle = (
+            f"{len(rows):,} matches, ordered by relevance."
+            if query
+            else "Newest first."
+        )
+        st.markdown(
+            '<div class="feed-intro">'
+            f"<strong>{html.escape(label)}</strong>"
+            f"<span>{html.escape(subtitle)}</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        visible_rows = rows[: st.session_state.feed_limit]
+        if not visible_rows:
+            if query and config.enable_vision and int(stats["visual_pending"] or 0):
+                st.warning(
+                    "No confident match yet. Older images and videos are still "
+                    "being read in the background.",
+                    icon=":material/image_search:",
+                )
+            else:
+                st.info(
+                    "Nothing matches yet. Try fewer words or a broader topic.",
+                    icon=":material/search:",
+                )
+            return
+
+        for row in visible_rows:
+            render_feed_card(
+                connection,
+                row,
+                key_prefix=f"feed-{row['id']}",
+                explain_match=bool(query),
+            )
+
+        if len(rows) > len(visible_rows):
+            if st.button(
+                "Load older",
+                icon=":material/expand_more:",
+                key="feed-load-older",
+                width="stretch",
+            ):
+                st.session_state.feed_limit += 12
+                st.rerun()
+        return
+
+    page_size = GALLERY_PAGE_SIZE if view in {"Media", "Videos", "GIFs"} else LIST_PAGE_SIZE
+    offset = (st.session_state.page - 1) * page_size
+    if query:
+        all_rows = search_library(
+            connection,
+            config,
+            query=query,
+            view=view,
+            scope=scope,
+            topic=topic,
+        )
+        total = len(all_rows)
+        rows = all_rows[offset : offset + page_size]
+    else:
+        rows, total = browse_library(
+            connection,
+            view=view,
+            scope=scope,
+            topic=topic,
+            limit=page_size,
+            offset=offset,
+        )
+
+    st.markdown(
+        '<div class="library-heading">'
+        f"<strong>{html.escape(view)}</strong>"
+        f"<span>{total:,} {'item' if total == 1 else 'items'}</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    if not rows:
+        st.info(
+            "Nothing matches this view yet.",
+            icon=":material/search:",
+        )
+        return
+
+    if view in {"Media", "Videos", "GIFs"}:
+        render_media_grid(rows, view)
+    else:
+        render_library_list(rows, view)
+    render_library_pagination(total, page_size, f"library-{view.lower()}")
+
+
 config = settings()
 connection = db(config.db_path)
 
@@ -1548,12 +1943,16 @@ if "scope_filter" not in st.session_state:
     st.session_state.scope_filter = "All"
 if st.session_state.scope_filter not in {"All", "Pinned", "Saved"}:
     st.session_state.scope_filter = "All"
-if "content_filter" not in st.session_state:
-    st.session_state.content_filter = "Everything"
-if st.session_state.content_filter not in CONTENT_TYPES:
-    st.session_state.content_filter = "Everything"
 if "app_mode" not in st.session_state:
     st.session_state.app_mode = "Library"
+if "library_view" not in st.session_state:
+    st.session_state.library_view = "Feed"
+if st.session_state.library_view not in LIBRARY_VIEWS:
+    st.session_state.library_view = "Feed"
+if "feed_limit" not in st.session_state:
+    st.session_state.feed_limit = 12
+if "selected_library_item" not in st.session_state:
+    st.session_state.selected_library_item = None
 
 reconcile_services(config)
 
@@ -1596,12 +1995,24 @@ stats = connection.execute(
         END)
             AS indexed,
         SUM(CASE
-            WHEN media_type = 'image'
-             AND media_path IS NOT NULL
+            WHEN media_path IS NOT NULL
              AND (
-                TRIM(vision_text) = ''
-                OR COALESCE(vision_model, '') != ?
-                OR vision_prompt_version < ?
+                (
+                    media_type = 'image'
+                    AND (
+                        TRIM(vision_text) = ''
+                        OR COALESCE(vision_model, '') != ?
+                        OR vision_prompt_version < ?
+                    )
+                )
+                OR (
+                    media_type = 'video'
+                    AND (
+                        TRIM(vision_text) = ''
+                        OR COALESCE(vision_model, '') != ?
+                        OR vision_prompt_version < ?
+                    )
+                )
              )
              AND duplicate_of_id IS NULL
             THEN 1 ELSE 0
@@ -1612,7 +2023,12 @@ stats = connection.execute(
         MAX(date_utc) AS latest
     FROM messages
     """,
-    (config.vision_model, VISION_PROMPT_VERSION),
+    (
+        config.vision_model,
+        VISION_PROMPT_VERSION,
+        config.vision_model,
+        VIDEO_VISION_PROMPT_VERSION,
+    ),
 ).fetchone()
 starred_count = connection.execute(
     """
@@ -1732,19 +2148,6 @@ available_topics = [
 if st.session_state.get("topic_filter") not in available_topics:
     st.session_state.topic_filter = "All topics"
 
-review_count = int(
-    bucket_by_category.get("Uncategorised", {}).get("item_count", 0)
-)
-
-latest_results = search(
-    connection,
-    config,
-    "",
-    "all",
-    1,
-    include_sensitive=False,
-)
-latest_row = latest_results[0] if latest_results else None
 pinned_results = search(
     connection,
     config,
@@ -1753,15 +2156,6 @@ pinned_results = search(
     3,
     include_sensitive=False,
     pinned_only=True,
-)
-review_results = search(
-    connection,
-    config,
-    "",
-    "all",
-    3,
-    include_sensitive=False,
-    category="Uncategorised",
 )
 pinned_count = int(stats["pinned"] or 0)
 
@@ -1918,7 +2312,8 @@ with header_left:
     st.markdown(
         '<div class="app-title">Telegram Brain</div>'
         '<div class="app-subtitle">'
-        "Send anything to Telegram, then find it again without digging."
+        "Browse and search everything you save in Telegram, including what "
+        "images and videos show."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1961,673 +2356,13 @@ if app_mode == "Send to Telegram":
     connection.close()
     st.stop()
 
-st.markdown(
-    '<div class="search-label">Find anything</div>',
-    unsafe_allow_html=True,
-)
-
-q = st.text_input(
-    "Search",
-    placeholder="Describe a person, scene, meme or text you remember",
-    key="search_query",
-    label_visibility="collapsed",
-    on_change=reset_page,
-)
-
-scope_column, topic_column, format_column = st.columns(
-    [1.5, 2.2, 1.2],
-    vertical_alignment="bottom",
-)
-with scope_column:
-    scope = st.segmented_control(
-        "Show",
-        ["All", "Pinned", "Saved"],
-        key="scope_filter",
-        on_change=reset_page,
-        width="stretch",
-    )
-with topic_column:
-    selected_topic = st.selectbox(
-        "Topic",
-        available_topics,
-        key="topic_filter",
-        on_change=reset_page,
-    )
-with format_column:
-    content_label = st.selectbox(
-        "Format",
-        list(CONTENT_TYPES),
-        key="content_filter",
-        on_change=reset_page,
-    )
-
-scope = scope or "All"
-
-st.markdown(
-    '<div class="library-context">'
-    "Search checks image content, captions, documents, voice notes, "
-    "filenames and links. Combine topic and format filters when needed."
-    "</div>",
-    unsafe_allow_html=True,
-)
-
-home_mode = (
-    not q
-    and scope == "All"
-    and selected_topic == "All topics"
-    and content_label == "Everything"
-)
-
-if home_mode:
-    if review_count:
-        st.markdown(
-            '<div class="section-title">Review inbox</div>'
-            '<div class="section-subtitle">'
-            "Give unclassified captures a useful home as the library grows."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        with st.container(border=True):
-            review_metric, review_details, review_action = st.columns(
-                [1.2, 5, 1.3],
-                vertical_alignment="center",
-            )
-            with review_metric:
-                st.markdown(
-                    f'<div class="review-count">{review_count:,}</div>'
-                    '<div class="result-meta">need a topic</div>',
-                    unsafe_allow_html=True,
-                )
-            with review_details:
-                classified_count = max(
-                    int(stats["total"] or 0) - review_count,
-                    0,
-                )
-                st.markdown(
-                    '<div class="review-copy">'
-                    f'<strong>{classified_count:,} captures are already '
-                    "organised.</strong> Review the remainder when convenient; "
-                    "the original content stays searchable either way."
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-                if review_results:
-                    review_titles = " · ".join(
-                        clean_preview(result_title(row), 48)
-                        for row in review_results
-                    )
-                    st.caption("Up next: " + review_titles)
-            with review_action:
-                st.button(
-                    "Review now",
-                    icon=":material/inbox:",
-                    on_click=open_bucket,
-                    args=("Uncategorised",),
-                    width="stretch",
-                )
-
-    if pinned_results:
-        pinned_header, pinned_action = st.columns(
-            [8, 1],
-            vertical_alignment="center",
-        )
-        with pinned_header:
-            st.markdown(
-                '<div class="pinned-section">'
-                '<div class="pinned-title">Pinned essentials</div>'
-                '<div class="section-subtitle">'
-                "Important Telegram pins, kept close at hand."
-                "</div></div>",
-                unsafe_allow_html=True,
-            )
-        with pinned_action:
-            st.button(
-                "View all",
-                icon=":material/push_pin:",
-                on_click=open_pinned,
-                width="content",
-            )
-
-        pinned_columns = st.columns(len(pinned_results))
-        for column, pinned_row in zip(pinned_columns, pinned_results):
-            pinned_text = mask_sensitive_text(
-                pinned_row.get("text")
-                or pinned_row.get("extracted_text")
-                or ""
-            ).strip()
-            pinned_category = (
-                pinned_row.get("display_category") or "Uncategorised"
-            )
-            with column:
-                with st.container(border=True):
-                    st.badge("Pinned", color="orange")
-                    st.badge(pinned_category, color="gray")
-                    st.markdown(
-                        '<div class="result-title">'
-                        + html.escape(result_title(pinned_row))
-                        + "</div>",
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(
-                        '<div class="pinned-preview">'
-                        + html.escape(
-                            clean_preview(
-                                pinned_text or "Media saved without a caption.",
-                                150,
-                            )
-                        )
-                        + "</div>",
-                        unsafe_allow_html=True,
-                    )
-                    render_copy_actions(
-                        pinned_row,
-                        f"pinned-{pinned_row['id']}",
-                    )
-
-    if latest_row:
-        st.markdown(
-            '<div class="section-title">Pick up where you left off</div>'
-            '<div class="section-subtitle">'
-            "Ready to reuse without digging through Telegram."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        with st.container(border=True):
-            latest_main, latest_action = st.columns(
-                [5, 1],
-                vertical_alignment="top",
-            )
-            latest_category = (
-                latest_row.get("display_category") or "Uncategorised"
-            )
-            latest_text = mask_sensitive_text(
-                latest_row.get("text") or ""
-            ).strip()
-            title_text = latest_text
-            latest_title = result_title(
-                {**latest_row, "text": title_text}
-            )
-            latest_preview = latest_text
-            first_line = next(
-                (
-                    line.strip()
-                    for line in title_text.splitlines()
-                    if line.strip()
-                ),
-                "",
-            )
-            if first_line and latest_preview.startswith(first_line):
-                latest_preview = latest_preview[len(first_line) :].strip()
-            with latest_main:
-                st.badge(latest_category, color="gray")
-                st.markdown(
-                    '<div class="result-title">'
-                    + html.escape(latest_title)
-                    + "</div>",
-                    unsafe_allow_html=True,
-                )
-                if latest_row.get("capture_size", 1) > 1:
-                    st.markdown(
-                        '<div class="result-meta">'
-                        + html.escape(
-                            f"{latest_row.get('capture_size')} linked messages"
-                        )
-                        + "</div>",
-                        unsafe_allow_html=True,
-                    )
-                if latest_preview:
-                    display_preview = re.sub(
-                        r"(?m)^#{1,6}\s+",
-                        "",
-                        latest_preview,
-                    )
-                    st.markdown(
-                        '<div class="latest-preview">'
-                        + html.escape(clean_preview(display_preview, 260))
-                        + "</div>",
-                        unsafe_allow_html=True,
-                    )
-            with latest_action:
-                st.button(
-                    "Open",
-                    icon=":material/arrow_forward:",
-                    key="open-latest-bucket",
-                    on_click=open_bucket,
-                    args=(latest_category,),
-                    width="content",
-                )
-            render_copy_actions(
-                latest_row,
-                f"latest-{latest_row['id']}",
-            )
-            render_link_actions(
-                latest_row,
-                f"latest-{latest_row['id']}",
-            )
-
-    st.markdown(
-        '<div class="section-title">Browse by topic</div>'
-        '<div class="section-subtitle">'
-        "Your archive is grouped by what each capture is about, not only "
-        "by file type."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-    for row_start in range(0, len(topic_rows), 4):
-        bucket_columns = st.columns(4)
-        for column, bucket in zip(
-            bucket_columns,
-            topic_rows[row_start : row_start + 4],
-        ):
-            category = bucket["display_category"]
-            bucket_title = result_title(bucket)
-            with column:
-                with st.container(border=True):
-                    st.badge(category, color="gray")
-                    st.markdown(
-                        f'<div class="bucket-count">'
-                        f'{int(bucket["item_count"]):,}'
-                        "</div>",
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(
-                        '<div class="bucket-description">'
-                        + html.escape(
-                            TOPIC_DESCRIPTIONS.get(
-                                category,
-                                "Related captures from your archive",
-                            )
-                        )
-                        + "</div>",
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(
-                        '<div class="bucket-latest">'
-                        + "Latest: "
-                        + html.escape(clean_preview(bucket_title, 68))
-                        + "</div>",
-                        unsafe_allow_html=True,
-                    )
-                    st.button(
-                        "Open bucket",
-                        icon=":material/arrow_forward:",
-                        key=f"open-bucket-{category}",
-                        on_click=open_bucket,
-                        args=(category,),
-                        width="stretch",
-                    )
-
-    connection.close()
-    st.stop()
-
-active_label = "Library"
-if q:
-    active_label = f'Results for "{clean_preview(q, 50)}"'
-elif scope != "All":
-    active_label = scope
-elif selected_topic == "Uncategorised":
-    active_label = "Review inbox"
-elif selected_topic != "All topics":
-    active_label = selected_topic
-elif content_label != "Everything":
-    active_label = content_label
-
-library_header, home_action = st.columns(
-    [8, 1],
-    vertical_alignment="center",
-)
-with library_header:
-    st.markdown(
-        f'<div class="section-title">{html.escape(active_label)}</div>',
-        unsafe_allow_html=True,
-    )
-with home_action:
-    st.button(
-        "Home",
-        icon=":material/home:",
-        on_click=show_homepage,
-        width="content",
-    )
-
-rows = search(
+render_library_workspace(
     connection,
     config,
-    q,
-    CONTENT_TYPES[content_label],
-    max(stats["total"], 1),
-    include_sensitive=False,
-    category=selected_topic,
-    starred_only=scope == "Saved",
-    pinned_only=scope == "Pinned",
+    available_topics=available_topics,
+    stats=stats,
+    pinned_results=pinned_results,
 )
-if selected_topic != "All topics":
-    rows = [
-        row
-        for row in rows
-        if (
-            row.get("display_category")
-            or row.get("category")
-            or "Uncategorised"
-        )
-        == selected_topic
-    ]
-rows = process_scope(rows, scope)
-rows = process_content_filter(rows, content_label)
-
-if not q:
-    rows.sort(
-        key=lambda row: (
-            row_datetime(row["date_utc"]),
-            row["message_id"],
-        ),
-        reverse=True,
-    )
-
-result_label = "result" if len(rows) == 1 else "results"
-active_filters = []
-if (
-    selected_topic not in {"All topics", "Uncategorised"}
-    and selected_topic != active_label
-):
-    active_filters.append(selected_topic)
-if content_label != "Everything":
-    active_filters.append(content_label)
-filter_context = (
-    " · " + " · ".join(active_filters)
-    if active_filters
-    else ""
-)
-st.markdown(
-    '<div class="result-count">'
-    + f"{len(rows):,} {result_label}"
-    + html.escape(filter_context)
-    + "</div>",
-    unsafe_allow_html=True,
-)
-
-if not rows:
-    if q and config.enable_vision and int(stats["visual_pending"] or 0):
-        st.warning(
-            "No confident match yet. The upgraded image reader is still "
-            f"re-reading {int(stats['visual_pending']):,} older images in "
-            "the background; new images are handled first.",
-            icon=":material/image_search:",
-        )
-    else:
-        st.info(
-            "Nothing matches these filters yet. Try a broader search or "
-            "another topic.",
-            icon=":material/search:",
-        )
-    connection.close()
-    st.stop()
-
-total_pages = max(1, math.ceil(len(rows) / page_size))
-st.session_state.page = min(st.session_state.page, total_pages)
-start = (st.session_state.page - 1) * page_size
-end = min(start + page_size, len(rows))
-page_rows = rows[start:end]
-
-if total_pages > 1:
-    nav_left, nav_middle, nav_right = st.columns([1, 2, 1])
-    with nav_left:
-        if st.button(
-            "Previous",
-            icon=":material/arrow_back:",
-            disabled=st.session_state.page <= 1,
-            width="stretch",
-        ):
-            st.session_state.page -= 1
-            st.rerun()
-    with nav_middle:
-        st.caption(
-            f"Page {st.session_state.page} of {total_pages} · "
-            f"showing {start + 1}–{end}"
-        )
-    with nav_right:
-        if st.button(
-            "Next",
-            icon=":material/arrow_forward:",
-            disabled=st.session_state.page >= total_pages,
-            width="stretch",
-        ):
-            st.session_state.page += 1
-            st.rerun()
-
-for row in page_rows:
-    existing_media = existing_media_items(row)
-    media_exists = bool(existing_media)
-    media = existing_media[0]["_path"] if existing_media else None
-    text = mask_sensitive_text(row.get("text") or "").strip()
-    extracted_text = mask_sensitive_text(
-        row.get("extracted_text") or ""
-    ).strip()
-    vision_text = mask_sensitive_text(
-        row.get("vision_text") or ""
-    ).strip()
-    title = result_title({**row, "text": text})
-    category = row.get("display_category") or row.get("category")
-    note = row.get("note") or ""
-
-    with st.container(border=True):
-        main, action = st.columns([12, 1], vertical_alignment="top")
-        with main:
-            if row.get("is_pinned"):
-                st.badge("Pinned in Telegram", color="orange")
-            st.badge(category, color="gray")
-            status_label, status_color = index_label(row)
-            if row.get("content_status") != "ready":
-                st.badge(status_label, color=status_color)
-            if row.get("_duplicate_count"):
-                st.badge(
-                    f"{row['_duplicate_count']} repeats avoided",
-                    color="gray",
-                )
-            st.markdown(
-                f'<div class="result-title">{html.escape(title)}</div>',
-                unsafe_allow_html=True,
-            )
-            if row.get("capture_size", 1) > 1:
-                st.markdown(
-                    '<div class="result-meta">'
-                    + html.escape(
-                        f"{row.get('capture_size')} linked messages"
-                    )
-                    + "</div>",
-                    unsafe_allow_html=True,
-                )
-        with action:
-            if st.button(
-                "",
-                icon=(
-                    ":material/star:"
-                    if row.get("starred")
-                    else ":material/star_outline:"
-                ),
-                help=(
-                    "Remove from saved"
-                    if row.get("starred")
-                    else "Save for later"
-                ),
-                key=f"star-{row['id']}",
-                width="content",
-            ):
-                set_item_state(
-                    connection,
-                    row["id"],
-                    starred=not bool(row.get("starred")),
-                )
-                st.rerun()
-
-        images = [
-            item
-            for item in existing_media
-            if item.get("media_type") == "image"
-        ]
-        if len(images) == 1:
-            media_col, text_col = st.columns(
-                [1, 2.2],
-                vertical_alignment="top",
-            )
-            with media_col:
-                st.image(str(images[0]["_path"]), width="stretch")
-            with text_col:
-                if text:
-                    st.write(clean_preview(text))
-                elif extracted_text:
-                    st.write(clean_preview(extracted_text))
-                elif vision_text:
-                    st.write(visual_preview(vision_text))
-                else:
-                    st.caption("Image saved without a caption.")
-        elif images:
-            image_columns = st.columns(min(3, len(images)))
-            for index, item in enumerate(images[:6]):
-                with image_columns[index % len(image_columns)]:
-                    st.image(str(item["_path"]), width="stretch")
-            if text:
-                st.write(clean_preview(text))
-            elif extracted_text:
-                st.write(clean_preview(extracted_text))
-            elif vision_text:
-                st.write(visual_preview(vision_text))
-        else:
-            if text:
-                st.write(clean_preview(text))
-            elif extracted_text:
-                st.write(clean_preview(extracted_text))
-            elif media_exists:
-                st.caption(media.name)
-            else:
-                st.caption("No preview available.")
-
-        if len(re.sub(r"\s+", " ", text)) > 520:
-            with st.expander("Read full text"):
-                st.write(text)
-
-        playable = [
-            item
-            for item in existing_media
-            if item.get("media_type") in {"video", "audio"}
-        ]
-        for item in playable:
-            if item.get("media_type") == "video":
-                with st.expander(
-                    "Play " + (item.get("file_name") or "video")
-                ):
-                    st.video(str(item["_path"]))
-            else:
-                st.audio(str(item["_path"]))
-
-        render_copy_actions(row, f"result-{row['id']}")
-        render_link_actions(row, f"result-{row['id']}")
-        if note:
-            st.caption(f"Note: {clean_preview(note, 120)}")
-
-        with st.expander("Why it matched"):
-            if row.get("is_pinned"):
-                st.markdown("- Pinned in the source Telegram chat")
-            for reason in row.get("_match_reasons") or [
-                "Shown by the current library filters"
-            ]:
-                st.markdown(f"- {reason}")
-            if row.get("content_status") == "ready":
-                st.caption(
-                    "All available text, files, media and links in this "
-                    "capture have been checked."
-                )
-            elif row.get("content_status") == "indexing":
-                st.caption(
-                    "This capture is still being read in the background. "
-                    "Search coverage will improve automatically."
-                )
-            else:
-                st.caption(
-                    "Some content could not be read. The original Telegram "
-                    "text, filenames and URLs remain searchable."
-                )
-                if row.get("content_error"):
-                    st.caption(clean_preview(row["content_error"], 280))
-            if extracted_text:
-                st.markdown("**Indexed content preview**")
-                st.write(clean_preview(extracted_text, 900))
-            if vision_text:
-                st.markdown("**What the image reader saw**")
-                st.write(clean_preview(vision_text, 900))
-
-        with st.expander(
-            (
-                "Choose a topic"
-                if selected_topic == "Uncategorised"
-                else "Organise"
-            ),
-            expanded=selected_topic == "Uncategorised",
-        ):
-            editor_left, editor_right = st.columns([1, 2])
-            with editor_left:
-                category_options = ORGANISE_TOPICS
-                current_category = (
-                    row.get("user_category")
-                    or row.get("category")
-                    or "Uncategorised"
-                )
-                if current_category not in category_options:
-                    current_category = "Uncategorised"
-                user_category = st.selectbox(
-                    "Topic",
-                    category_options,
-                    index=category_options.index(current_category),
-                    key=f"category-{row['id']}",
-                )
-            with editor_right:
-                user_note = st.text_area(
-                    "Private note",
-                    value=note,
-                    placeholder="Why this matters, what to do next…",
-                    key=f"note-{row['id']}",
-                    height=96,
-                )
-            if st.button(
-                "Save changes",
-                icon=":material/check:",
-                key=f"save-{row['id']}",
-            ):
-                set_item_state(
-                    connection,
-                    row["id"],
-                    note=user_note,
-                    user_category=user_category,
-                )
-                st.toast("Saved.")
-                st.rerun()
-
-if total_pages > 1:
-    st.divider()
-    bottom_left, bottom_middle, bottom_right = st.columns([1, 2, 1])
-    with bottom_left:
-        if st.button(
-            "Previous",
-            icon=":material/arrow_back:",
-            disabled=st.session_state.page <= 1,
-            key="previous-bottom",
-            width="stretch",
-        ):
-            st.session_state.page -= 1
-            st.rerun()
-    with bottom_middle:
-        st.caption(
-            f"Showing {start + 1}–{end} of {len(rows):,} results"
-        )
-    with bottom_right:
-        if st.button(
-            "Next",
-            icon=":material/arrow_forward:",
-            disabled=st.session_state.page >= total_pages,
-            key="next-bottom",
-            width="stretch",
-        ):
-            st.session_state.page += 1
-            st.rerun()
 
 warning, warning_at = get_runtime_state(connection, "last_search_warning")
 if warning and warning_at:
@@ -2635,5 +2370,5 @@ if warning and warning_at:
         minutes=5
     ):
         st.caption("Search used a local fallback on the last query.")
-
 connection.close()
+st.stop()
