@@ -131,6 +131,22 @@ st.markdown(
             opacity: 0.64;
         }
 
+        .match-note {
+            font-size: 0.72rem;
+            line-height: 1.35;
+            margin: 0.15rem 0 0.35rem;
+            min-height: 1.95rem;
+            opacity: 0.62;
+            overflow-wrap: anywhere;
+        }
+
+        .filter-summary {
+            font-size: 0.78rem;
+            line-height: 1.4;
+            margin-top: 0.35rem;
+            opacity: 0.62;
+        }
+
         .sync-online {
             color: var(--brain-teal);
             font-size: 0.84rem;
@@ -622,6 +638,9 @@ def result_title(row: dict) -> str:
             host = urlparse(first_line).netloc.replace("www.", "")
             return f"Link from {host}" if host else "Saved link"
         return clean_preview(first_line, 100)
+    note = (row.get("note") or "").strip()
+    if note:
+        return clean_preview(note, 100)
     metadata_title = next(
         (
             item.get("title")
@@ -734,10 +753,6 @@ def render_copy_actions(row: dict, key_prefix: str) -> None:
     if not actions:
         return
 
-    st.markdown(
-        '<div class="action-label">Use this item</div>',
-        unsafe_allow_html=True,
-    )
     columns = st.columns(len(actions))
     for column, (action, label) in zip(columns, actions):
         with column:
@@ -1227,7 +1242,7 @@ def render_selected_item(connection, row: dict) -> None:
                             1400,
                         )
                     )
-        with st.expander("Organise"):
+        with st.expander("Help me find this again"):
             current_category = (
                 row.get("user_category")
                 or row.get("category")
@@ -1242,10 +1257,11 @@ def render_selected_item(connection, row: dict) -> None:
                 key=f"detail-category-{row['id']}",
             )
             user_note = st.text_area(
-                "Private note",
+                "Search words, names or a short note",
                 value=row.get("note") or "",
                 key=f"detail-note-{row['id']}",
                 height=88,
+                placeholder="Add the words you are likely to search later",
             )
             if st.button(
                 "Save changes",
@@ -1258,11 +1274,16 @@ def render_selected_item(connection, row: dict) -> None:
                     note=user_note,
                     user_category=user_category,
                 )
-                st.toast("Saved.")
+                st.toast("Saved and searchable.")
                 st.rerun()
 
 
-def render_media_grid(rows: list[dict], view: str) -> None:
+def render_media_grid(
+    rows: list[dict],
+    view: str,
+    *,
+    explain_matches: bool = False,
+) -> None:
     assets: list[tuple[dict, dict]] = []
     for row in rows:
         for item in existing_media_items(row):
@@ -1276,7 +1297,7 @@ def render_media_grid(rows: list[dict], view: str) -> None:
                 and not _is_gif_item(item)
             ):
                 assets.append((row, item))
-    column_count = 6 if view == "Media" else 3
+    column_count = 3 if explain_matches else (6 if view == "Media" else 3)
     for row_start in range(0, len(assets), column_count):
         asset_row = assets[row_start : row_start + column_count]
         columns = st.columns(column_count, gap="small")
@@ -1299,6 +1320,22 @@ def render_media_grid(rows: list[dict], view: str) -> None:
                         str(item["_path"]),
                         autoplay=False,
                         loop=view == "GIFs",
+                    )
+                if explain_matches:
+                    reasons = row.get("_match_reasons") or []
+                    reason = next(
+                        (
+                            item
+                            for item in reasons
+                            if item.startswith("Possible match")
+                        ),
+                        next(iter(reasons), "Matched searchable content"),
+                    )
+                    st.markdown(
+                        '<div class="match-note">'
+                        + html.escape(reason)
+                        + "</div>",
+                        unsafe_allow_html=True,
                     )
                 copy_col, open_col = st.columns(2, gap="small")
                 with copy_col:
@@ -1713,13 +1750,13 @@ def render_library_workspace(
     pinned_results: list[dict],
 ) -> None:
     st.markdown(
-        '<div class="search-label">Search the whole archive</div>',
+        '<div class="search-label">Find something</div>',
         unsafe_allow_html=True,
     )
     query = st.text_input(
         "Search",
         placeholder=(
-            "Describe a person, scene, video, meme, quote or idea you remember"
+            "Describe what you remember: a person, scene, meme, video, link or idea"
         ),
         key="search_query",
         label_visibility="collapsed",
@@ -1730,16 +1767,26 @@ def render_library_workspace(
         "Browse",
         LIBRARY_VIEWS,
         key="library_view",
+        format_func=lambda option: {
+            "Feed": "All",
+            "Media": "Images",
+        }.get(option, option),
         width="stretch",
         label_visibility="collapsed",
         on_change=reset_page,
     ) or "Feed"
 
-    scope_column, topic_column = st.columns(
-        [1.3, 2.4],
-        vertical_alignment="bottom",
+    current_scope = st.session_state.get("scope_filter", "All")
+    current_topic = st.session_state.get("topic_filter", "All topics")
+    active_filters = int(current_scope != "All") + int(
+        current_topic != "All topics"
     )
-    with scope_column:
+    filter_label = "Filters" + (f" ({active_filters})" if active_filters else "")
+    with st.popover(
+        filter_label,
+        icon=":material/tune:",
+        width="content",
+    ):
         scope = st.segmented_control(
             "Show",
             ["All", "Pinned", "Saved"],
@@ -1747,12 +1794,23 @@ def render_library_workspace(
             on_change=reset_page,
             width="stretch",
         ) or "All"
-    with topic_column:
         topic = st.selectbox(
             "Topic",
             available_topics,
             key="topic_filter",
             on_change=reset_page,
+        )
+    if active_filters:
+        filter_parts = []
+        if current_scope != "All":
+            filter_parts.append(current_scope)
+        if current_topic != "All topics":
+            filter_parts.append(current_topic)
+        st.markdown(
+            '<div class="filter-summary">Showing '
+            + html.escape(" · ".join(filter_parts))
+            + "</div>",
+            unsafe_allow_html=True,
         )
 
     selected = load_library_row(
@@ -1763,11 +1821,26 @@ def render_library_workspace(
         render_selected_item(connection, selected)
 
     if view == "Feed":
-        requested_kind = (
-            "video"
-            if re.search(r"\b(?:video|clip|screen recording)\b", query, re.IGNORECASE)
-            else "all"
-        )
+        inferred_view = None
+        if re.search(r"\b(?:gif|reaction gif)\b", query, re.IGNORECASE):
+            inferred_view = "GIFs"
+        elif re.search(
+            r"\b(?:video|clip|screen recording|reel)\b",
+            query,
+            re.IGNORECASE,
+        ):
+            inferred_view = "Videos"
+        elif re.search(
+            r"\b(?:image|photo|picture|meme|screenshot)\b",
+            query,
+            re.IGNORECASE,
+        ):
+            inferred_view = "Media"
+        requested_kind = {
+            "Media": "image",
+            "Videos": "video",
+            "GIFs": "video",
+        }.get(inferred_view, "all")
         search_limit = (
             max(200, st.session_state.feed_limit + 1)
             if query
@@ -1792,6 +1865,43 @@ def render_library_workspace(
                 ),
                 reverse=True,
             )
+
+        if query and not inferred_view and rows:
+            image_matches = sum(row_matches_view(row, "Media") for row in rows)
+            video_matches = sum(row_matches_view(row, "Videos") for row in rows)
+            if image_matches / len(rows) >= 0.7:
+                inferred_view = "Media"
+            elif video_matches / len(rows) >= 0.7:
+                inferred_view = "Videos"
+
+        if query and inferred_view:
+            visual_rows = [
+                row for row in rows if row_matches_view(row, inferred_view)
+            ][:36]
+            label = {
+                "Media": "Image matches",
+                "Videos": "Video matches",
+                "GIFs": "GIF matches",
+            }[inferred_view]
+            st.markdown(
+                '<div class="feed-intro">'
+                f"<strong>{label}</strong>"
+                f"<span>{len(visual_rows):,} found</span>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            if not visual_rows:
+                st.info(
+                    "No confident visual match yet.",
+                    icon=":material/image_search:",
+                )
+                return
+            render_media_grid(
+                visual_rows,
+                inferred_view,
+                explain_matches=True,
+            )
+            return
 
         home_feed = (
             not query and scope == "All" and topic == "All topics"
@@ -1871,13 +1981,23 @@ def render_library_workspace(
                 )
             return
 
-        for row in visible_rows:
-            render_feed_card(
-                connection,
-                row,
-                key_prefix=f"feed-{row['id']}",
-                explain_match=bool(query),
-            )
+        if query:
+            for row in visible_rows:
+                render_feed_card(
+                    connection,
+                    row,
+                    key_prefix=f"feed-{row['id']}",
+                    explain_match=True,
+                )
+        else:
+            feed_columns = st.columns(2, gap="small")
+            for index, row in enumerate(visible_rows):
+                with feed_columns[index % 2]:
+                    render_feed_card(
+                        connection,
+                        row,
+                        key_prefix=f"feed-{row['id']}",
+                    )
 
         if len(rows) > len(visible_rows):
             if st.button(
@@ -1943,8 +2063,11 @@ if "scope_filter" not in st.session_state:
     st.session_state.scope_filter = "All"
 if st.session_state.scope_filter not in {"All", "Pinned", "Saved"}:
     st.session_state.scope_filter = "All"
-if "app_mode" not in st.session_state:
-    st.session_state.app_mode = "Library"
+if (
+    "app_mode" not in st.session_state
+    or st.session_state.app_mode not in {"Find & browse", "Send to Telegram"}
+):
+    st.session_state.app_mode = "Find & browse"
 if "library_view" not in st.session_state:
     st.session_state.library_view = "Feed"
 if st.session_state.library_view not in LIBRARY_VIEWS:
@@ -2312,8 +2435,7 @@ with header_left:
     st.markdown(
         '<div class="app-title">Telegram Brain</div>'
         '<div class="app-subtitle">'
-        "Browse and search everything you save in Telegram, including what "
-        "images and videos show."
+        "Find, reuse or send anything from one place."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -2330,22 +2452,20 @@ st.markdown(
     '<div class="status-strip">'
     '<span class="status-item">'
     f'<span class="status-dot{" online" if sync_online else ""}"></span>'
-    f'{"Sync live" if sync_online else "Sync needs attention"}'
+    f'{"Telegram synced" if sync_online else "Sync needs attention"}'
     "</span>"
     '<span class="status-item">'
     f'<span class="status-dot{" online" if index_online else ""}"></span>'
-    f'{"Indexer live" if index_online else "Indexer paused"}'
+    f'{"Search ready" if index_online else "Search updating"}'
     "</span>"
-    f'<span class="status-item">{int(stats["total"] or 0):,} captures</span>'
-    f'<span class="status-item">{pinned_count:,} pinned</span>'
-    f'<span class="status-item">{starred_count:,} saved</span>'
+    f'<span class="status-item">{int(stats["total"] or 0):,} saved items</span>'
     "</div>",
     unsafe_allow_html=True,
 )
 
 app_mode = st.segmented_control(
     "Workspace",
-    ["Library", "Send to Telegram"],
+    ["Find & browse", "Send to Telegram"],
     key="app_mode",
     width="content",
     label_visibility="collapsed",

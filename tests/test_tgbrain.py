@@ -204,6 +204,74 @@ class TelegramBrainTests(unittest.TestCase):
             "Research & Learning",
         )
 
+    def test_personal_search_note_becomes_searchable(self):
+        self.insert(
+            3,
+            "",
+            media_type="image",
+            file_name="IMG_003.jpg",
+        )
+        row = self.connection.execute(
+            "SELECT id FROM messages WHERE message_id = 3"
+        ).fetchone()
+        set_item_state(
+            self.connection,
+            row["id"],
+            note="Jensen Huang reaction meme for an NVIDIA launch",
+        )
+
+        results = search(
+            self.connection,
+            self.config,
+            "Jensen Huang",
+            limit=20,
+        )
+
+        self.assertEqual([item["message_id"] for item in results], [3])
+        self.assertIn("Matched your search note", results[0]["_match_reasons"])
+
+    def test_public_figure_role_alias_can_recover_an_unnamed_image(self):
+        self.insert(
+            4,
+            "",
+            media_type="image",
+            file_name="political-meme.jpg",
+        )
+        row = dict(
+            self.connection.execute(
+                "SELECT * FROM messages WHERE message_id = 4"
+            ).fetchone()
+        )
+        description = (
+            "Summary: A man in a suit smiles in front of the Chinese flag.\n"
+            "People: Unknown\n"
+            "Setting: Government event"
+        )
+        row["vision_text"] = description
+        row["indexed_text"] = build_indexed_text(row)
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET vision_text = ?, indexed_text = ?
+            WHERE id = ?
+            """,
+            (description, row["indexed_text"], row["id"]),
+        )
+        self.connection.commit()
+
+        results = search(
+            self.connection,
+            self.config,
+            "Xi Jingping",
+            limit=20,
+        )
+
+        self.assertEqual([item["message_id"] for item in results], [4])
+        self.assertIn(
+            "Possible match from a known role or visual context",
+            results[0]["_match_reasons"],
+        )
+
     def test_continuation_inherits_recent_context(self):
         timestamp = "2026-07-20T12:00:00+00:00"
         self.insert(

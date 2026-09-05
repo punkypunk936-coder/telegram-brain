@@ -35,9 +35,12 @@ Telegram's service chat when you use it as a personal inbox.
   original GIFs/videos/documents and multi-asset albums directly to the
   macOS clipboard.
 - Carries topic context across adjacent parts of the same long capture.
-- Lets you star useful items, add private notes and correct a topic.
+- Lets you star useful items, add your own searchable names/notes and correct a
+  topic, so a weak automatic image label can be fixed once and found later.
 - Detects credentials and sensitive documents, then hides them from normal results.
 - Adds local semantic search and detailed image understanding through Ollama.
+- Returns strong text and visual-context matches immediately, using the slower
+  semantic pass only when the fast local search finds nothing.
 
 The archive does not edit, delete or forward existing Telegram messages. The
 Send to Telegram workspace can create new messages only in the explicitly

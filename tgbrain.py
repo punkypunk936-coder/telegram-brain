@@ -59,8 +59,10 @@ PERSON_QUERY_GENERIC = {
     "asian",
     "black",
     "boy",
+    "ceo",
     "chinese",
     "find",
+    "founder",
     "girl",
     "government",
     "image",
@@ -80,6 +82,43 @@ PERSON_QUERY_GENERIC = {
     "suit",
     "video",
     "woman",
+}
+
+# Vision models are often better at recognizing a public role or a familiar
+# visual setting than naming the person. These aliases widen recall while the
+# person-name guard below still keeps unrelated semantic matches out.
+PERSON_CONTEXT_ALIASES = {
+    ("jensen", "huang"): (
+        ("nvidia", "ceo"),
+        ("nvidia", "founder"),
+        ("nvidia", "leather", "jacket"),
+        ("nvidia", "keynote"),
+        ("leather", "jacket", "glasses"),
+    ),
+    ("xi", "jinping"): (
+        ("chinese", "president"),
+        ("china", "president"),
+        ("chinese", "leader", "suit"),
+        ("china", "leader", "suit"),
+        ("chinese", "flag", "suit"),
+    ),
+    ("sam", "altman"): (
+        ("openai", "ceo"),
+        ("openai", "founder"),
+    ),
+    ("mark", "zuckerberg"): (
+        ("meta", "ceo"),
+        ("facebook", "founder"),
+    ),
+    ("elon", "musk"): (
+        ("tesla", "ceo"),
+        ("spacex", "founder"),
+        ("x", "owner"),
+    ),
+    ("vitalik", "buterin"): (
+        ("ethereum", "founder"),
+        ("ethereum", "cofounder"),
+    ),
 }
 
 SECRET_PATTERNS = (
@@ -1654,6 +1693,64 @@ def _matches_people_field(vision_text: str | None, terms: list[str]) -> bool:
     return _covers_person_terms(match.group(1), terms)
 
 
+def _value_terms(value: str | None) -> set[str]:
+    return {
+        token.strip(".-").lower()
+        for token in re.findall(r"[\w+#.-]+", value or "", re.UNICODE)
+        if token.strip(".-")
+    }
+
+
+def _term_coverage(terms: list[str], value: str | None) -> int:
+    value_terms = _value_terms(value)
+    return sum(
+        1
+        for term in terms
+        if term in value_terms
+        or (
+            len(term) >= 4
+            and any(token.startswith(term) for token in value_terms)
+        )
+    )
+
+
+def _person_aliases(terms: list[str]) -> tuple[tuple[str, ...], ...]:
+    for identity, aliases in PERSON_CONTEXT_ALIASES.items():
+        if _covers_person_terms(" ".join(identity), terms):
+            return aliases
+    return ()
+
+
+def _person_context_match(item: dict, terms: list[str]) -> tuple[bool, bool]:
+    if not terms:
+        return True, False
+    if _matches_people_field(item.get("vision_text"), terms):
+        return True, False
+    if _covers_person_terms(item.get("note"), terms):
+        return True, False
+    if _covers_person_terms(item.get("indexed_text"), terms):
+        return True, False
+
+    if item.get("media_type") not in {"image", "video"}:
+        return False, False
+
+    searchable = " ".join(
+        str(item.get(field) or "")
+        for field in (
+            "indexed_text",
+            "note",
+            "user_category",
+            "vision_text",
+            "extracted_text",
+        )
+    )
+    value_terms = _value_terms(searchable)
+    for alias in _person_aliases(terms):
+        if all(term in value_terms for term in alias):
+            return True, True
+    return False, False
+
+
 def _match_reasons(parts: list[dict], query: str) -> list[str]:
     terms = _query_terms(query)
     if not terms:
@@ -1677,6 +1774,10 @@ def _match_reasons(parts: list[dict], query: str) -> list[str]:
 
     if any(matched(part.get("text")) for part in parts):
         reasons.append("Matched the original Telegram text")
+    if any(matched(part.get("note")) for part in parts):
+        reasons.append("Matched your search note")
+    if any(matched(part.get("user_category")) for part in parts):
+        reasons.append("Matched your topic")
     if any(matched(part.get("file_name")) for part in parts):
         reasons.append("Matched a saved file name")
     if any(matched(part.get("urls_json")) for part in parts):
@@ -1709,6 +1810,11 @@ def _match_reasons(parts: list[dict], query: str) -> list[str]:
         reasons.append("Matched an AI image description")
     if "video" in vision_types:
         reasons.append("Matched people, scenes or text seen in a video")
+    person_terms = _person_query_terms(query)
+    if person_terms and any(
+        _person_context_match(part, person_terms)[1] for part in parts
+    ):
+        reasons.append("Possible match from a known role or visual context")
     if not reasons and any(
         float(part.get("_semantic_score") or 0) > 0 for part in parts
     ):
@@ -2027,64 +2133,66 @@ def search(
                 f"FTS fallback used: {error}",
             )
 
-    if not found:
-        terms = _query_terms(query)[:8]
-        if terms:
-            rows = connection.execute(
-                f"""
-                {select} {where}
-                ORDER BY m.date_utc DESC, m.message_id DESC
-                """,
-                filter_params,
-            ).fetchall()
-            person_terms = _person_query_terms(query)
-            candidates = []
-            for row in rows:
-                item = dict(row)
-                value_terms = {
-                    token.lower()
-                    for token in re.findall(
-                        r"[\w+#.-]+",
-                        item.get("indexed_text") or "",
-                        re.UNICODE,
-                    )
-                }
-                coverage = sum(
-                    1
-                    for term in terms
-                    if term in value_terms
-                    or (
-                        len(term) >= 4
-                        and any(
-                            token.startswith(term)
-                            for token in value_terms
-                        )
-                    )
-                )
-                if person_terms:
-                    if not _matches_people_field(
-                        item.get("vision_text"),
-                        person_terms,
-                    ):
-                        continue
-                    coverage = max(coverage, len(person_terms))
-                elif coverage < min(2, len(terms)):
-                    continue
-                item["_keyword_score"] = coverage / len(terms)
-                item["_semantic_score"] = 0.0
-                candidates.append(item)
-            candidates.sort(
-                key=lambda item: (
-                    item["_keyword_score"],
-                    item["date_utc"],
-                    item["message_id"],
-                ),
-                reverse=True,
+    terms = _query_terms(query)[:8]
+    if terms:
+        rows = connection.execute(
+            f"""
+            {select} {where}
+            ORDER BY m.date_utc DESC, m.message_id DESC
+            """,
+            filter_params,
+        ).fetchall()
+        person_terms = _person_query_terms(query)
+        candidates = []
+        for row in rows:
+            item = dict(row)
+            searchable = " ".join(
+                str(item.get(field) or "")
+                for field in ("indexed_text", "note", "user_category")
             )
-            for item in candidates[: limit * 2]:
+            coverage = _term_coverage(terms, searchable)
+            note_coverage = _term_coverage(terms, item.get("note"))
+            alias_match = False
+            if person_terms:
+                person_match, alias_match = _person_context_match(
+                    item,
+                    person_terms,
+                )
+                if not person_match:
+                    continue
+                coverage = max(coverage, len(person_terms))
+            elif coverage < min(2, len(terms)):
+                continue
+            keyword_score = coverage / len(terms)
+            if note_coverage >= min(2, len(terms)):
+                keyword_score = max(keyword_score, 1.15)
+            elif alias_match:
+                keyword_score = max(keyword_score, 0.78)
+            item["_keyword_score"] = keyword_score
+            item["_semantic_score"] = 0.0
+            candidates.append(item)
+        candidates.sort(
+            key=lambda item: (
+                item["_keyword_score"],
+                item["date_utc"],
+                item["message_id"],
+            ),
+            reverse=True,
+        )
+        for item in candidates[: limit * 2]:
+            existing = found.get(item["id"])
+            if existing:
+                existing["_keyword_score"] = max(
+                    float(existing.get("_keyword_score") or 0),
+                    item["_keyword_score"],
+                )
+            else:
                 found[item["id"]] = item
 
-    if config.enable_embeddings:
+    # A good keyword, label, or guarded visual-context match is already useful.
+    # Calling the local embedding model after that only delays the interface;
+    # reserve semantic retrieval for queries the fast path cannot answer.
+    if config.enable_embeddings and not found:
         try:
             query_vector = embed(config, query)
             person_query_terms = _person_query_terms(query)
@@ -2107,16 +2215,10 @@ def search(
                 if score < SEMANTIC_MIN_SCORE:
                     continue
                 if item["id"] not in found and person_query_terms:
-                    if item.get("media_type") == "image":
-                        matches_person = _matches_people_field(
-                            item.get("vision_text"),
-                            person_query_terms,
-                        )
-                    else:
-                        matches_person = _covers_person_terms(
-                            item.get("indexed_text"),
-                            person_query_terms,
-                        )
+                    matches_person, _ = _person_context_match(
+                        item,
+                        person_query_terms,
+                    )
                     if not matches_person:
                         continue
                 if item["id"] in found:
